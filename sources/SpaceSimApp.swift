@@ -41,6 +41,7 @@ final class SpaceSimulationController: ObservableObject {
     let terrainRootNode = SCNNode()
     let terrainMeshNode = SCNNode()
     let oceanMeshNode = SCNNode()
+    let surfacePropsNode = SCNNode()
     let skyDomeNode = SCNNode()
     let ambientLightNode = SCNNode()
 
@@ -93,6 +94,11 @@ final class SpaceSimulationController: ObservableObject {
     @Published var isWalkingOnSurface: Bool = false
     @Published var isOverWater: Bool = false
     @Published var canAutoLand: Bool = false
+    @Published var evaSprinting: Bool = false
+    @Published var evaJetpackActive: Bool = false
+    @Published var evaJetpackFuel: Double = 1.0
+    @Published var evaShipDistanceText: String = "7 м"
+    @Published var evaTempText: String = "15 °C"
 
     let speedSteps: [(label: String, mps: Double)] = [
         ("1.5 км/с", 1_500),
@@ -103,7 +109,9 @@ final class SpaceSimulationController: ObservableObject {
         ("1 c", 299_792_458),
         ("100 c", 29_979_245_800),
         ("10 000 c", 2_997_924_580_000),
-        ("500 000 c", 149_896_229_000_000)
+        ("500 000 c", 149_896_229_000_000),
+        ("10 млн c", 2_997_924_580_000_000),
+        ("1 млрд c", 299_792_458_000_000_000)
     ]
 
     let timeWarpSteps: [(label: String, mult: Double)] = [
@@ -141,6 +149,8 @@ final class SpaceSimulationController: ObservableObject {
     private var evaHeightAboveGround: Double = 1.85
     private var evaWalkPhase: Double = 0.0
     private var evaRefForwardLocal: SIMD3<Double> = SIMD3<Double>(0, 0, -1)
+    private var jetpackFuelState: Double = 1.0
+    private var hasPropsForCurrentAnchor: Bool = false
     private var parkedShipBodyId: String?
     private var parkedShipLocalPos: SIMD3<Double> = .zero
     private var parkedShipLocalOrient: simd_quatd = simd_quatd(angle: 0, axis: SIMD3<Double>(0, 1, 0))
@@ -192,6 +202,7 @@ final class SpaceSimulationController: ObservableObject {
 
         terrainRootNode.addChildNode(terrainMeshNode)
         terrainRootNode.addChildNode(oceanMeshNode)
+        terrainRootNode.addChildNode(surfacePropsNode)
         terrainRootNode.isHidden = true
         scene.rootNode.addChildNode(terrainRootNode)
 
@@ -206,10 +217,12 @@ final class SpaceSimulationController: ObservableObject {
         skyMat.shaderModifiers = [.fragment: SurfaceTerrainEngine.skyDomeShaderModifier()]
         skyMat.setValue(NSValue(scnVector3: SCNVector3(0, 1, 0)), forKey: "sunDirView")
         skyMat.setValue(NSValue(scnVector3: SCNVector3(0, 1, 0)), forKey: "upDirView")
+        skyMat.setValue(NSValue(scnVector3: SCNVector3(1, 0, 0)), forKey: "eastDirView")
         skyMat.setValue(NSValue(scnVector3: SCNVector3(0.08, 0.28, 0.78)), forKey: "zenithCol")
         skyMat.setValue(NSValue(scnVector3: SCNVector3(0.48, 0.76, 1.00)), forKey: "horizonCol")
         skyMat.setValue(NSValue(scnVector3: SCNVector3(1.00, 0.42, 0.14)), forKey: "sunsetCol")
         skyMat.setValue(NSNumber(value: Float(0.0)), forKey: "atmoDensity")
+        skyMat.setValue(NSNumber(value: Float(0.0)), forKey: "cloudAmount")
         skySphere.materials = [skyMat]
         skyDomeMaterial = skyMat
         skyDomeNode.geometry = skySphere
@@ -269,26 +282,52 @@ final class SpaceSimulationController: ObservableObject {
             let root = SCNNode()
             root.eulerAngles.z = Float(body.axialTiltRad)
 
-            let sphere = SCNSphere(radius: 1.0)
-            sphere.segmentCount = 144
+            let sphere = SCNSphere(radius: body.isGalaxy ? 0.20 : 1.0)
+            sphere.segmentCount = body.isGalaxy ? 32 : ((body.category == .solar || body.id == "moon") ? 120 : 64)
 
             let mat = SCNMaterial()
             mat.diffuse.contents = whitePixel
 
-            if body.id == "sgr_a" {
+            if body.isBlackHole {
                 mat.lightingModel = .constant
                 mat.diffuse.contents = UIColor.black
+                let ringTint = (body.id == "cygnus_x1") ? "vec3(0.55, 0.85, 1.0)" : "vec3(1.0, 0.72, 0.35)"
                 mat.shaderModifiers = [.fragment: """
                     float ndotv = clamp(abs(dot(normalize(_surface.normal), normalize(_surface.view))), 0.0, 1.0);
-                    float photonRing = pow(1.0 - ndotv, 9.0) * 3.0;
-                    _output.color = vec4(vec3(1.0, 0.72, 0.35) * photonRing, 1.0);
+                    float photonRing = pow(max(0.0001, 1.0 - ndotv), 9.0) * 3.0;
+                    _output.color = vec4(\(ringTint) * photonRing, 1.0);
                 """]
+            } else if body.isGalaxy {
+                mat.lightingModel = .constant
+                let c = rgbComponents(body.colorHex)
+                mat.diffuse.contents = UIColor.clear
+                mat.emission.contents = UIColor(red: CGFloat(c.r), green: CGFloat(c.g), blue: CGFloat(c.b), alpha: 1.0)
+                mat.shaderModifiers = [.fragment: """
+                    float ndotv = clamp(abs(dot(normalize(_surface.normal), normalize(_surface.view))), 0.0, 1.0);
+                    float core = pow(max(0.0001, ndotv), 1.8) * 1.35;
+                    _output.color = vec4(vec3(\(c.r), \(c.g), \(c.b)) * core, core);
+                """]
+                mat.blendMode = .add
+                mat.writesToDepthBuffer = false
+
+                let diskSize: CGFloat = (body.id == "ic1101") ? 3.2 : 2.6
+                let diskPlane = SCNPlane(width: diskSize, height: diskSize)
+                let diskMat = SCNMaterial()
+                diskMat.lightingModel = .constant
+                diskMat.diffuse.contents = generateGalaxyImage(for: body)
+                diskMat.isDoubleSided = true
+                diskMat.writesToDepthBuffer = false
+                diskMat.blendMode = .add
+                diskPlane.materials = [diskMat]
+                let diskNode = SCNNode(geometry: diskPlane)
+                diskNode.eulerAngles.x = -.pi / 2.0
+                root.addChildNode(diskNode)
             } else if body.isStar {
                 mat.lightingModel = .constant
                 mat.shaderModifiers = [.surface: starShaderModifier(for: body)]
 
                 let corona = SCNSphere(radius: 1.28)
-                corona.segmentCount = 64
+                corona.segmentCount = 48
                 let cMat = SCNMaterial()
                 cMat.lightingModel = .constant
                 cMat.blendMode = .add
@@ -297,14 +336,14 @@ final class SpaceSimulationController: ObservableObject {
                 let c = rgbComponents(body.colorHex)
                 cMat.shaderModifiers = [.fragment: """
                     float ndotv = clamp(abs(dot(normalize(_surface.normal), normalize(_surface.view))), 0.0, 1.0);
-                    float glow = pow(ndotv, 3.8) * 0.85;
+                    float glow = pow(max(0.0001, ndotv), 3.8) * 0.85;
                     _output.color = vec4(vec3(\(c.r), \(c.g), \(c.b)) * glow, glow);
                 """]
                 corona.materials = [cMat]
                 root.addChildNode(SCNNode(geometry: corona))
             } else {
                 mat.lightingModel = .physicallyBased
-                mat.roughness.contents = body.id == "earth" ? 0.42 : 0.88
+                mat.roughness.contents = body.isHabitableWorld ? 0.42 : (body.isIcyWorld ? 0.45 : 0.88)
                 mat.metalness.contents = 0.02
                 mat.shaderModifiers = [.surface: planetShaderModifier(for: body)]
                 mat.setValue(NSValue(scnVector3: SCNVector3(1, 0, 0)), forKey: "sunDirLocal")
@@ -316,31 +355,18 @@ final class SpaceSimulationController: ObservableObject {
             root.addChildNode(meshNode)
             planetMeshNodes[body.id] = meshNode
 
-            if body.hasAtmosphere && !body.isStar {
+            if body.hasAtmosphere && !body.isStar && !body.isBlackHole && !body.isGalaxy {
                 let atmoSphere = SCNSphere(radius: 1.055)
-                atmoSphere.segmentCount = 96
+                atmoSphere.segmentCount = 64
                 let atmoMat = SCNMaterial()
                 atmoMat.lightingModel = .constant
                 atmoMat.blendMode = .add
                 atmoMat.cullMode = .front
                 atmoMat.writesToDepthBuffer = false
 
-                let dayCol: String
-                let sunsetCol: String
-                switch body.id {
-                case "mars":
-                    dayCol = "vec3(0.92, 0.48, 0.26)"
-                    sunsetCol = "vec3(0.80, 0.25, 0.10)"
-                case "venus":
-                    dayCol = "vec3(0.95, 0.78, 0.48)"
-                    sunsetCol = "vec3(0.90, 0.45, 0.18)"
-                case "neptune", "uranus":
-                    dayCol = "vec3(0.28, 0.72, 1.0)"
-                    sunsetCol = "vec3(0.18, 0.45, 0.95)"
-                default:
-                    dayCol = "vec3(0.22, 0.58, 1.0)"
-                    sunsetCol = "vec3(1.0, 0.44, 0.14)"
-                }
+                let pal = body.atmospherePalette
+                let dayCol = "vec3(\(pal.horizon.x), \(pal.horizon.y), \(pal.horizon.z))"
+                let sunsetCol = "vec3(\(pal.sunset.x), \(pal.sunset.y), \(pal.sunset.z))"
 
                 atmoMat.shaderModifiers = [.fragment: """
                     uniform vec3 sunDirView;
@@ -348,10 +374,11 @@ final class SpaceSimulationController: ObservableObject {
                     vec3 n = normalize(-_surface.normal);
                     vec3 v = normalize(_surface.view);
                     float ndotv = clamp(dot(n, v), 0.0, 1.0);
-                    float halo = pow(ndotv, 3.2) * smoothstep(0.0, 0.35, 1.0 - ndotv);
+                    float halo = pow(max(0.0001, ndotv), 3.2) * smoothstep(0.0, 0.35, 1.0 - ndotv);
                     float sunDot = dot(n, normalize(sunDirView));
                     float dayMask = smoothstep(-0.25, 0.32, sunDot);
-                    float sunset = exp(-pow((sunDot + 0.04) * 4.5, 2.0));
+                    float tw = (sunDot + 0.04) * 4.5;
+                    float sunset = exp(-(tw * tw));
                     vec3 col = mix(\(dayCol), \(sunsetCol), sunset * 0.65);
                     _output.color = vec4(col * halo * dayMask * 2.2, halo * dayMask);
                 """]
@@ -364,7 +391,7 @@ final class SpaceSimulationController: ObservableObject {
             }
 
             if body.hasRings {
-                let isBH = (body.id == "sgr_a")
+                let isBH = body.isBlackHole
                 let isUranus = (body.id == "uranus")
                 let planeSize: CGFloat = isBH ? 7.6 : (isUranus ? 3.8 : 5.2)
                 let ringPlane = SCNPlane(width: planeSize, height: planeSize)
@@ -389,6 +416,72 @@ final class SpaceSimulationController: ObservableObject {
         }
     }
 
+    private func generateGalaxyImage(for body: CelestialBody) -> UIImage {
+        let size = 512
+        let format = UIGraphicsImageRendererFormat()
+        format.opaque = false
+        format.scale = 1.0
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: size, height: size), format: format)
+
+        let cCore = uiColor(from: body.colorHex)
+        let cArm = uiColor(from: body.secondaryHex)
+        let isElliptical = (body.id == "ic1101")
+
+        return renderer.image { context in
+            let ctx = context.cgContext
+            ctx.clear(CGRect(x: 0, y: 0, width: size, height: size))
+            let center = CGPoint(x: size / 2, y: size / 2)
+
+            if let grad = CGGradient(
+                colorsSpace: CGColorSpaceCreateDeviceRGB(),
+                colors: [
+                    cCore.withAlphaComponent(0.95).cgColor,
+                    cArm.withAlphaComponent(0.35).cgColor,
+                    UIColor.clear.cgColor
+                ] as CFArray,
+                locations: [0.0, 0.35, 1.0]
+            ) {
+                ctx.drawRadialGradient(
+                    grad,
+                    startCenter: center,
+                    startRadius: 2,
+                    endCenter: center,
+                    endRadius: CGFloat(size) * 0.46,
+                    options: []
+                )
+            }
+
+            var rng: UInt64 = UInt64(bitPattern: Int64(body.id.hashValue)) ^ 0x9E3779B97F4A7C15
+            func rand() -> Double {
+                rng = rng &* 6364136223846793005 &+ 1442695040888963407
+                return Double(rng >> 33) / Double(1 << 31)
+            }
+
+            let arms = isElliptical ? 1 : 2
+            let starCount = isElliptical ? 1400 : 2200
+            for i in 0..<starCount {
+                let rNorm = pow(rand(), 0.72)
+                let radius = rNorm * Double(size) * 0.45
+                let angle: Double
+                if isElliptical {
+                    angle = rand() * .pi * 2.0
+                } else {
+                    let armOffset = Double(i % arms) * (.pi * 2.0 / Double(arms))
+                    let twist = rNorm * 4.8
+                    let spread = (rand() - 0.5) * (0.45 + rNorm * 0.65)
+                    angle = armOffset + twist + spread
+                }
+                let x = Double(center.x) + cos(angle) * radius
+                let y = Double(center.y) + sin(angle) * radius * (isElliptical ? 0.78 : 1.0)
+                let dotR = CGFloat(1.0 + rand() * 2.6)
+                let alpha = CGFloat((1.0 - rNorm * 0.85) * (0.25 + rand() * 0.55))
+                let col = (rNorm < 0.25) ? cCore : cArm
+                ctx.setFillColor(col.withAlphaComponent(alpha).cgColor)
+                ctx.fillEllipse(in: CGRect(x: x - Double(dotR) * 0.5, y: y - Double(dotR) * 0.5, width: Double(dotR), height: Double(dotR)))
+            }
+        }
+    }
+
     private func compressToScene(_ relMeters: SIMD3<Double>) -> (pos: SIMD3<Float>, scaleFactor: Double) {
         let dist = simd_length(relMeters)
         let maxRenderDist = 420_000.0
@@ -408,8 +501,7 @@ final class SpaceSimulationController: ObservableObject {
         var vertices: [SCNVector3] = []
         var indices: [Int32] = []
         let segments = 72
-        vertices.reserveCapacity(10 * segments)
-        indices.reserveCapacity(10 * segments * 2)
+        let maxSystemDist = 250.0 * UniverseCatalog.au
 
         for body in UniverseCatalog.bodies where body.semiMajorAxisMeters > 0 && body.orbitalPeriodSeconds > 0 {
             let parentPos: SIMD3<Double>
@@ -417,6 +509,10 @@ final class SpaceSimulationController: ObservableObject {
                 parentPos = parent.currentPosition(simulationTime: simulationTimeSeconds, allBodies: UniverseCatalog.bodies)
             } else {
                 parentPos = .zero
+            }
+
+            if simd_length(parentPos - shipPositionMeters) > maxSystemDist {
+                continue
             }
 
             let baseIndex = Int32(vertices.count)
@@ -432,6 +528,11 @@ final class SpaceSimulationController: ObservableObject {
             }
         }
 
+        if vertices.isEmpty {
+            orbitLinesNode.geometry = nil
+            return
+        }
+
         let source = SCNGeometrySource(vertices: vertices)
         let element = SCNGeometryElement(indices: indices, primitiveType: .line)
         let geometry = SCNGeometry(sources: [source], elements: [element])
@@ -441,15 +542,21 @@ final class SpaceSimulationController: ObservableObject {
 
     private func planetShaderModifier(for body: CelestialBody) -> String {
         let mode: Int
-        switch body.id {
-        case "earth": mode = 1
-        case "mars": mode = 2
-        case "jupiter", "saturn", "uranus", "neptune": mode = 3
-        default: mode = 4
+        if body.isHabitableWorld {
+            mode = 1
+        } else if body.id == "mars" || body.id == "trappist1d" {
+            mode = 2
+        } else if body.isGasGiant {
+            mode = 3
+        } else if body.isIcyWorld || body.id == "trappist1f" || body.id == "trappist1g" {
+            mode = 5
+        } else {
+            mode = 4
         }
 
         let c1 = rgbComponents(body.colorHex)
         let c2 = rgbComponents(body.secondaryHex)
+        let hasCities = (body.id == "earth") ? 1 : 0
 
         return """
         uniform vec3 sunDirLocal;
@@ -520,7 +627,7 @@ final class SpaceSimulationController: ObservableObject {
                 rough = 0.55;
             } else if (elev < 0.50) {
                 float depth = clamp(elev / 0.50, 0.0, 1.0);
-                albedo = mix(vec3(0.008, 0.04, 0.18), vec3(0.03, 0.26, 0.56), pow(depth, 2.2));
+                albedo = mix(vec3(0.008, 0.04, 0.18), vec3(0.03, 0.26, 0.56), pow(max(0.0001, depth), 2.2));
                 rough = 0.14;
             } else {
                 float h = clamp((elev - 0.50) / 0.42, 0.0, 1.0);
@@ -537,7 +644,7 @@ final class SpaceSimulationController: ObservableObject {
                 rough = 0.92;
                 bumpStrength = 10.0;
 
-                if (h < 0.28 && lat < 0.68 && nightMask > 0.01) {
+                if (\(hasCities) == 1 && h < 0.28 && lat < 0.68 && nightMask > 0.01) {
                     float cityCluster = fbm(pos * 24.0);
                     float lights = hash31(floor(pos * 260.0));
                     if (cityCluster > 0.54 && lights > 0.84) {
@@ -568,6 +675,12 @@ final class SpaceSimulationController: ObservableObject {
             albedo = mix(col2, col1, smoothstep(0.15, 0.85, stripe));
             albedo *= (0.88 + detail * 0.24);
             rough = 0.62;
+        } else if (planetMode == 5) {
+            float crev = abs(detail * 2.0 - 1.0);
+            albedo = mix(col2, col1, smoothstep(0.25, 0.78, n));
+            albedo = mix(albedo, vec3(0.32, 0.54, 0.78), smoothstep(0.60, 0.94, 1.0 - crev) * 0.55);
+            rough = 0.42;
+            bumpStrength = 12.0;
         } else {
             float crater = smoothstep(0.32, 0.68, detail);
             albedo = mix(col2, col1, smoothstep(0.22, 0.78, n));
@@ -577,7 +690,7 @@ final class SpaceSimulationController: ObservableObject {
 
         if (planetMode == 1 || planetMode == 2) {
             float ndotv = clamp(abs(dot(normalize(_surface.normal), normalize(_surface.view))), 0.0, 1.0);
-            float fresnel = pow(1.0 - ndotv, 3.2) * smoothstep(-0.15, 0.35, sunDot);
+            float fresnel = pow(max(0.0001, 1.0 - ndotv), 3.2) * smoothstep(-0.15, 0.35, sunDot);
             vec3 hazeCol = (planetMode == 1) ? vec3(0.28, 0.62, 1.0) : vec3(0.92, 0.48, 0.25);
             emissive += hazeCol * fresnel * 0.48;
         }
@@ -631,7 +744,7 @@ final class SpaceSimulationController: ObservableObject {
 
         float spots = smoothstep(0.22, 0.34, g1 * 0.7 + g2 * 0.3);
         float ndotv = clamp(abs(dot(normalize(_surface.normal), normalize(_surface.view))), 0.0, 1.0);
-        float limb = 0.35 + 0.65 * pow(ndotv, 0.55);
+        float limb = 0.35 + 0.65 * pow(max(0.0001, ndotv), 0.55);
 
         vec3 hotCol = vec3(\(c1.r), \(c1.g), \(c1.b));
         vec3 coolCol = vec3(\(c2.r), \(c2.g), \(c2.b));
@@ -1439,15 +1552,28 @@ final class SpaceSimulationController: ObservableObject {
         lastTerrainAltitude = -1
         activeSurfaceBodyId = nil
         lastTrackedBodyId = nil
+        hasPropsForCurrentAnchor = false
         terrainRootNode.isHidden = true
         skyDomeNode.isHidden = true
+        surfacePropsNode.isHidden = true
         reentryHeat = 0.0
 
         let bodyPos = body.currentPosition(simulationTime: simulationTimeSeconds, allBodies: UniverseCatalog.bodies)
-        let orbitDist = body.radiusMeters * (body.id == "sgr_a" ? 5.8 : 2.9)
+        let orbitDist: Double
+        if body.isBlackHole {
+            orbitDist = max(body.radiusMeters * 8.5, 50_000_000.0)
+        } else if body.isGalaxy {
+            orbitDist = body.radiusMeters * 2.4
+        } else if body.radiusMeters < 100_000 {
+            orbitDist = max(body.radiusMeters * 4.5, 120_000.0)
+        } else {
+            orbitDist = body.radiusMeters * 2.9
+        }
 
         let offsetDir: SIMD3<Double>
-        if body.isStar || simd_length(bodyPos) < 1_000 {
+        if body.isGalaxy || body.isBlackHole {
+            offsetDir = safeNormalize(SIMD3<Double>(0.45, 0.62, 0.64))
+        } else if body.isStar || simd_length(bodyPos) < 1_000 {
             offsetDir = safeNormalize(SIMD3<Double>(0.6, 0.25, 0.75))
         } else {
             let toSun = safeNormalize(-bodyPos)
@@ -1475,13 +1601,14 @@ final class SpaceSimulationController: ObservableObject {
         lastTerrainAltitude = -1
         activeSurfaceBodyId = nil
         lastTrackedBodyId = nil
+        hasPropsForCurrentAnchor = false
         reentryHeat = 0.0
 
         let bodyPos = body.currentPosition(simulationTime: simulationTimeSeconds, allBodies: UniverseCatalog.bodies)
         let (_, _, invRot) = planetSpinAndInvRot(for: body)
         let offsetDir = SurfaceTerrainEngine.findScenicApproachDirection(for: body, bodyPos: bodyPos, invPlanetRot: invRot)
         let sample = SurfaceTerrainEngine.sampleTerrain(localDir: invRot.act(offsetDir), body: body)
-        let groundH = (body.id == "earth") ? max(0.0, sample.heightMeters) : sample.heightMeters
+        let groundH = body.isHabitableWorld ? max(0.0, sample.heightMeters) : sample.heightMeters
 
         shipPositionMeters = bodyPos + offsetDir * (body.radiusMeters + groundH + 4_500.0)
         let toSun = simd_length_squared(bodyPos) > 1e6
@@ -1518,7 +1645,7 @@ final class SpaceSimulationController: ObservableObject {
         let upWorld = safeNormalize(shipPositionMeters - nearestPos, fallback: SIMD3<Double>(0, 1, 0))
         let (_, _, invRot) = planetSpinAndInvRot(for: nearestBody)
         let sample = SurfaceTerrainEngine.sampleTerrain(localDir: invRot.act(upWorld), body: nearestBody)
-        let effectiveGround = (nearestBody.id == "earth") ? max(0.0, sample.heightMeters) : sample.heightMeters
+        let effectiveGround = nearestBody.isHabitableWorld ? max(0.0, sample.heightMeters) : sample.heightMeters
         let radarAlt = max(0.0, nearestDist - effectiveGround)
         guard !sample.isWater && radarAlt < 1_800.0 else { return }
 
@@ -1571,7 +1698,7 @@ final class SpaceSimulationController: ObservableObject {
         let playerSpot = shipPositionMeters + tangentRight * 7.0
         let playerUp = safeNormalize(playerSpot - nearestPos, fallback: upWorld)
         let sample = SurfaceTerrainEngine.sampleTerrain(localDir: invRot.act(playerUp), body: nearestBody)
-        let gH = (nearestBody.id == "earth") ? max(0.0, sample.heightMeters) : sample.heightMeters
+        let gH = nearestBody.isHabitableWorld ? max(0.0, sample.heightMeters) : sample.heightMeters
         shipPositionMeters = nearestPos + playerUp * (nearestBody.radiusMeters + gH + 1.85)
 
         let lookAtShip = safeNormalize(shipFwd * 0.35 - tangentRight * 0.90)
@@ -1595,6 +1722,13 @@ final class SpaceSimulationController: ObservableObject {
         walkingState = true
         isWalkingOnSurface = true
         isFreeCamera = false
+        evaSprinting = false
+        evaJetpackActive = false
+        jetpackFuelState = 1.0
+        evaJetpackFuel = 1.0
+        evaShipDistanceText = "7 м"
+        evaTempText = "\(nearestBody.meanTempC) °C"
+        hasPropsForCurrentAnchor = false
         throttle = 0
         shipVelocityMetersPerSec = .zero
         angularVelYaw = 0
@@ -1619,6 +1753,11 @@ final class SpaceSimulationController: ObservableObject {
 
         walkingState = false
         isWalkingOnSurface = false
+        evaSprinting = false
+        evaJetpackActive = false
+        jetpackFuelState = 1.0
+        evaJetpackFuel = 1.0
+        hasPropsForCurrentAnchor = false
         landedState = true
         isLanded = true
         throttle = 0
@@ -1713,6 +1852,9 @@ final class SpaceSimulationController: ObservableObject {
             let bodyPos = body.currentPosition(simulationTime: simulationTimeSeconds, allBodies: UniverseCatalog.bodies)
             cachedPositions[body.id] = bodyPos
             let distCenter = simd_length(bodyPos - shipPositionMeters)
+            if body.isGalaxy && distCenter < body.radiusMeters * 1.15 {
+                continue
+            }
             let surfDist = max(0.0, distCenter - body.radiusMeters)
             if surfDist < nearestSurfaceDist {
                 nearestSurfaceDist = surfDist
@@ -1756,7 +1898,7 @@ final class SpaceSimulationController: ObservableObject {
             let localDir = invNearestRot.act(upWorld)
             let sample = SurfaceTerrainEngine.sampleTerrain(localDir: localDir, body: nearestBody)
             lastSampleIsWater = sample.isWater
-            currentGroundHeightMeters = (nearestBody.id == "earth") ? max(0.0, sample.heightMeters) : sample.heightMeters
+            currentGroundHeightMeters = nearestBody.isHabitableWorld ? max(0.0, sample.heightMeters) : sample.heightMeters
         } else {
             currentGroundHeightMeters = 0.0
         }
@@ -1770,6 +1912,7 @@ final class SpaceSimulationController: ObservableObject {
         }
         let effectiveMaxSpeed = autoSpeed ? autoMaxSpeedMps : speedSteps[speedIndex].mps
 
+        var exhaustJetpackFuel = false
         if walkingState {
             let curPlanetRot = planetRot(for: nearestBody)
             let refWorld = curPlanetRot.act(evaRefForwardLocal)
@@ -1781,30 +1924,47 @@ final class SpaceSimulationController: ObservableObject {
 
             let moveFwd = -Double(stickInput.y)
             let moveRight = Double(stickInput.x)
-            let horizVel = (walkFwd * moveFwd + walkRight * moveRight) * 7.5
+            let moveSpeed = evaSprinting ? 14.0 : 5.8
+            let horizVel = (walkFwd * moveFwd + walkRight * moveRight) * moveSpeed
             shipPositionMeters += horizVel * realDt
 
-            let gSurface = max(0.5, nearestBody.surfaceGravityG * 9.80665)
-            evaVerticalVel -= gSurface * realDt
+            let gSurface = max(0.25, nearestBody.surfaceGravityG * 9.80665)
+            if evaJetpackActive && jetpackFuelState > 0.01 {
+                let thrust = gSurface + 9.5
+                evaVerticalVel = min(22.0, evaVerticalVel + thrust * realDt)
+                jetpackFuelState = max(0.0, jetpackFuelState - realDt * 0.28)
+                if jetpackFuelState <= 0.01 {
+                    exhaustJetpackFuel = true
+                }
+            } else {
+                evaVerticalVel -= gSurface * realDt
+                if evaHeightAboveGround <= 1.86 {
+                    jetpackFuelState = min(1.0, jetpackFuelState + realDt * 0.35)
+                }
+            }
+
             evaHeightAboveGround += evaVerticalVel * realDt
             if evaHeightAboveGround <= 1.85 {
                 evaHeightAboveGround = 1.85
                 evaVerticalVel = 0.0
+            } else if evaHeightAboveGround > 450.0 {
+                evaHeightAboveGround = 450.0
+                evaVerticalVel = min(0.0, evaVerticalVel)
             }
 
             upWorld = safeNormalize(shipPositionMeters - nearestBodyPos, fallback: SIMD3<Double>(0, 1, 0))
             let sample = SurfaceTerrainEngine.sampleTerrain(localDir: invNearestRot.act(upWorld), body: nearestBody)
             lastSampleIsWater = sample.isWater
-            let effectiveGround = (nearestBody.id == "earth") ? max(0.0, sample.heightMeters) : sample.heightMeters
+            let effectiveGround = nearestBody.isHabitableWorld ? max(0.0, sample.heightMeters) : sample.heightMeters
             currentGroundHeightMeters = effectiveGround
 
             let horizSpeed = simd_length(horizVel)
             if horizSpeed > 0.3 && evaHeightAboveGround <= 1.86 {
-                evaWalkPhase += realDt * 9.5
+                evaWalkPhase += realDt * (evaSprinting ? 14.0 : 9.5)
             } else {
                 evaWalkPhase = 0.0
             }
-            let bob = (horizSpeed > 0.3 && evaHeightAboveGround <= 1.86) ? (sin(evaWalkPhase) * 0.07) : 0.0
+            let bob = (horizSpeed > 0.3 && evaHeightAboveGround <= 1.86) ? (sin(evaWalkPhase) * (evaSprinting ? 0.11 : 0.07)) : 0.0
 
             shipPositionMeters = nearestBodyPos + upWorld * (nearestBody.radiusMeters + effectiveGround + evaHeightAboveGround + bob)
             shipVelocityMetersPerSec = horizVel + upWorld * evaVerticalVel
@@ -1939,7 +2099,7 @@ final class SpaceSimulationController: ObservableObject {
             let localDir = invNearestRot.act(upWorld)
             let sample = SurfaceTerrainEngine.sampleTerrain(localDir: localDir, body: nearestBody)
             lastSampleIsWater = sample.isWater
-            let effectiveGround = (nearestBody.id == "earth") ? max(0.0, sample.heightMeters) : sample.heightMeters
+            let effectiveGround = nearestBody.isHabitableWorld ? max(0.0, sample.heightMeters) : sample.heightMeters
             currentGroundHeightMeters = effectiveGround
 
             let hoverClearance = isFreeCamera ? 2.0 : 1.35
@@ -1959,11 +2119,13 @@ final class SpaceSimulationController: ObservableObject {
             }
         }
 
+        var evaShipDistMeters = 0.0
         if walkingState, let pid = parkedShipBodyId, let pBody = UniverseCatalog.bodies.first(where: { $0.id == pid }) {
             let bPos = cachedPositions[pid] ?? pBody.currentPosition(simulationTime: simulationTimeSeconds, allBodies: UniverseCatalog.bodies)
             let bRot = planetRot(for: pBody)
             let shipWorldPos = bPos + bRot.act(parkedShipLocalPos)
             let rel = shipWorldPos - shipPositionMeters
+            evaShipDistMeters = simd_length(rel)
             parkedShipNode.simdPosition = SIMD3<Float>(Float(rel.x), Float(rel.y), Float(rel.z))
             let shipWorldOrient = simd_normalize(bRot * parkedShipLocalOrient)
             parkedShipNode.simdOrientation = simd_quatf(
@@ -2033,10 +2195,13 @@ final class SpaceSimulationController: ObservableObject {
             let movedFromAnchor = (lastTerrainAltitude >= 0)
                 ? simd_length(shipPositionMeters - currentAnchorWorld)
                 : Double.greatestFiniteMagnitude
+            let wantProps = updatedSurfaceDist < 2_500.0
+            let moveLimit = wantProps ? 220.0 : max(1_200.0, updatedSurfaceDist * 0.25)
             let needsRebuild = (activeSurfaceBodyId != nearestBody.id)
                 || (lastTerrainAltitude < 0)
                 || (abs(updatedSurfaceDist - lastTerrainAltitude) > max(400.0, lastTerrainAltitude * 0.25))
-                || (movedFromAnchor > max(1_200.0, updatedSurfaceDist * 0.25))
+                || (movedFromAnchor > moveLimit)
+                || (wantProps && !hasPropsForCurrentAnchor)
 
             if needsRebuild {
                 let res = SurfaceTerrainEngine.buildTerrainGeometry(
@@ -2055,6 +2220,41 @@ final class SpaceSimulationController: ObservableObject {
                 lastTerrainAnchorLocal = invNearestRot.act(shipPositionMeters - nearestBodyPos)
                 lastTerrainBuildPlanetRot = curPlanetRot
                 lastTerrainAltitude = updatedSurfaceDist
+
+                for child in surfacePropsNode.childNodes {
+                    child.removeFromParentNode()
+                }
+                if wantProps {
+                    let clearPos: SIMD3<Double>?
+                    if walkingState, let pid = parkedShipBodyId, pid == nearestBody.id {
+                        clearPos = nearestBodyPos + curPlanetRot.act(parkedShipLocalPos)
+                    } else if landedState {
+                        clearPos = shipPositionMeters
+                    } else {
+                        clearPos = nil
+                    }
+                    let builtProps = SurfaceTerrainEngine.buildSurfaceProps(
+                        body: nearestBody,
+                        bodyPos: nearestBodyPos,
+                        anchorWorld: shipPositionMeters,
+                        planetRot: curPlanetRot,
+                        invPlanetRot: invNearestRot,
+                        clearCenterWorld: clearPos
+                    )
+                    for child in builtProps.childNodes {
+                        surfacePropsNode.addChildNode(child)
+                    }
+                    surfacePropsNode.isHidden = false
+                    hasPropsForCurrentAnchor = true
+                } else {
+                    surfacePropsNode.isHidden = true
+                    hasPropsForCurrentAnchor = false
+                }
+            } else {
+                surfacePropsNode.isHidden = !wantProps
+                if !wantProps {
+                    hasPropsForCurrentAnchor = false
+                }
             }
 
             let anchorWorldNow = nearestBodyPos + curPlanetRot.act(lastTerrainAnchorLocal)
@@ -2074,6 +2274,8 @@ final class SpaceSimulationController: ObservableObject {
             terrainRootNode.opacity = CGFloat(max(0.0, min(1.0, (240_000.0 - updatedSurfaceDist) / 100_000.0)))
         } else {
             terrainRootNode.isHidden = true
+            surfacePropsNode.isHidden = true
+            hasPropsForCurrentAnchor = false
             activeSurfaceBodyId = nil
             lastTerrainAltitude = -1
         }
@@ -2085,15 +2287,22 @@ final class SpaceSimulationController: ObservableObject {
             let sunElev = max(-1.0, min(1.0, simd_dot(toSunBody, upWorld)))
             let dayFactor = max(0.0, min(1.0, (sunElev + 0.22) / 0.40))
 
+            let eastWorld = safeNormalize(
+                simd_cross(upWorld, SIMD3<Double>(0, 1, 0)),
+                fallback: SIMD3<Double>(1, 0, 0)
+            )
             let sunView = invCamQuat.act(SIMD3<Float>(Float(toSunBody.x), Float(toSunBody.y), Float(toSunBody.z)))
             let upView = invCamQuat.act(SIMD3<Float>(Float(upWorld.x), Float(upWorld.y), Float(upWorld.z)))
+            let eastView = invCamQuat.act(SIMD3<Float>(Float(eastWorld.x), Float(eastWorld.y), Float(eastWorld.z)))
 
             skyDomeMaterial?.setValue(NSValue(scnVector3: SCNVector3(sunView.x, sunView.y, sunView.z)), forKey: "sunDirView")
             skyDomeMaterial?.setValue(NSValue(scnVector3: SCNVector3(upView.x, upView.y, upView.z)), forKey: "upDirView")
+            skyDomeMaterial?.setValue(NSValue(scnVector3: SCNVector3(eastView.x, eastView.y, eastView.z)), forKey: "eastDirView")
             skyDomeMaterial?.setValue(NSValue(scnVector3: SCNVector3(pal.zenith.x, pal.zenith.y, pal.zenith.z)), forKey: "zenithCol")
             skyDomeMaterial?.setValue(NSValue(scnVector3: SCNVector3(pal.horizon.x, pal.horizon.y, pal.horizon.z)), forKey: "horizonCol")
             skyDomeMaterial?.setValue(NSValue(scnVector3: SCNVector3(pal.sunset.x, pal.sunset.y, pal.sunset.z)), forKey: "sunsetCol")
             skyDomeMaterial?.setValue(NSNumber(value: Float(atmoDensity)), forKey: "atmoDensity")
+            skyDomeMaterial?.setValue(NSNumber(value: Float(nearestBody.cloudCoverage)), forKey: "cloudAmount")
 
             let fogBrightness = CGFloat(0.12 + 0.88 * dayFactor)
             let twilightMix = Float(exp(-pow((sunElev + 0.02) * 5.0, 2.0))) * 0.45
@@ -2115,13 +2324,21 @@ final class SpaceSimulationController: ObservableObject {
             ambientLightNode.light?.intensity = 22.0
         }
 
-        var newMarkers: [BodyScreenMarker] = []
+        var prioritizedMarkers: [BodyScreenMarker] = []
+        var otherMarkers: [(dist: Double, marker: BodyScreenMarker)] = []
         let viewBounds = (renderer as? SCNView)?.bounds ?? CGRect(x: 0, y: 0, width: 844, height: 390)
 
         for body in UniverseCatalog.bodies {
             guard let node = bodyNodes[body.id] else { continue }
             let bodyPos = cachedPositions[body.id] ?? body.currentPosition(simulationTime: simulationTimeSeconds, allBodies: UniverseCatalog.bodies)
             let rel = bodyPos - shipPositionMeters
+            let distRel = simd_length(rel)
+            if body.isGalaxy && distRel < body.radiusMeters * 1.05 {
+                node.isHidden = true
+                continue
+            }
+            node.isHidden = false
+
             let (renderPos, scaleFactor) = compressToScene(rel)
             let renderRadius = max(0.35, body.radiusMeters * scaleFactor)
 
@@ -2149,7 +2366,7 @@ final class SpaceSimulationController: ObservableObject {
                 atmoNodes[body.id]?.isHidden = false
             }
 
-            if !body.isStar {
+            if !body.isStar && !body.isGalaxy && !body.isBlackHole {
                 let toSunWorld = safeNormalize(-bodyPos, fallback: SIMD3<Double>(1, 0, 0))
                 let toSunF = SIMD3<Float>(Float(toSunWorld.x), Float(toSunWorld.y), Float(toSunWorld.z))
 
@@ -2169,8 +2386,19 @@ final class SpaceSimulationController: ObservableObject {
                     let px = CGFloat(projected.x)
                     let py = CGFloat(projected.y)
                     if px >= 16 && px <= viewBounds.width - 16 && py >= 46 && py <= viewBounds.height - 64 {
-                        let col = body.isStar ? Color.yellow : (body.id == targetBody.id ? Color.cyan : Color.white)
-                        newMarkers.append(BodyScreenMarker(
+                        let col: Color
+                        if body.id == targetBody.id {
+                            col = .cyan
+                        } else if body.isBlackHole {
+                            col = .purple
+                        } else if body.isGalaxy {
+                            col = .orange
+                        } else if body.isStar {
+                            col = .yellow
+                        } else {
+                            col = .white
+                        }
+                        let marker = BodyScreenMarker(
                             id: body.id,
                             name: body.name,
                             x: px,
@@ -2178,11 +2406,19 @@ final class SpaceSimulationController: ObservableObject {
                             color: col,
                             isTarget: body.id == targetBody.id,
                             isStar: body.isStar
-                        ))
+                        )
+                        if body.id == targetBody.id || body.id == "sun" {
+                            prioritizedMarkers.append(marker)
+                        } else {
+                            otherMarkers.append((dist: distRel, marker: marker))
+                        }
                     }
                 }
             }
         }
+        otherMarkers.sort { $0.dist < $1.dist }
+        let remainingMarkers = max(0, 18 - prioritizedMarkers.count)
+        let newMarkers = prioritizedMarkers + otherMarkers.prefix(remainingMarkers).map { $0.marker }
 
         if frameCounter % 2 == 0 {
             updateOrbitLines()
@@ -2223,6 +2459,10 @@ final class SpaceSimulationController: ObservableObject {
         let currentCanLand = targetBody.isLandable
         let currentOverWater = lastSampleIsWater
         let autoLandReady = !landedState && !walkingState && !isFreeCamera && nearestBody.isLandable && radarAlt < 1_800.0 && !currentOverWater
+        let currentFuel = jetpackFuelState
+        let evaShipDistStr = Self.formatDistance(evaShipDistMeters)
+        let evaTempStr = "\(nearestBody.meanTempC) °C"
+        let didExhaustJetpack = exhaustJetpackFuel
 
         DispatchQueue.main.async {
             self.distanceText = Self.formatDistance(surfaceDist)
@@ -2240,6 +2480,12 @@ final class SpaceSimulationController: ObservableObject {
             self.atmosphereZoneText = zoneStr
             self.reentryHeat = heatValue
             self.canLandOnTarget = currentCanLand
+            self.evaJetpackFuel = currentFuel
+            if didExhaustJetpack {
+                self.evaJetpackActive = false
+            }
+            self.evaShipDistanceText = evaShipDistStr
+            self.evaTempText = evaTempStr
         }
     }
 
@@ -2250,7 +2496,11 @@ final class SpaceSimulationController: ObservableObject {
         if km < 1_000_000 { return String(format: "%.1f тыс. км", km / 1_000) }
         let au = meters / UniverseCatalog.au
         if au < 10_000 { return String(format: "%.3f а.е.", au) }
-        return String(format: "%.2f св. лет", meters / UniverseCatalog.ly)
+        let ly = meters / UniverseCatalog.ly
+        if ly < 1_000 { return String(format: "%.2f св. лет", ly) }
+        if ly < 1_000_000 { return String(format: "%.1f тыс. св.л", ly / 1_000) }
+        if ly < 1_000_000_000 { return String(format: "%.2f млн св.л", ly / 1_000_000) }
+        return String(format: "%.2f млрд св.л", ly / 1_000_000_000)
     }
 
     static func formatSpeed(_ mps: Double) -> String {
@@ -2260,6 +2510,8 @@ final class SpaceSimulationController: ObservableObject {
         let c = mps / 299_792_458.0
         if c < 10_000 { return String(format: "%.2f c", c) }
         let lys = mps / UniverseCatalog.ly
+        if lys >= 1_000_000 { return String(format: "%.2f млн св.л/с", lys / 1_000_000) }
+        if lys >= 1_000 { return String(format: "%.1f тыс. св.л/с", lys / 1_000) }
         if lys >= 0.01 { return String(format: "%.2f св.л/с", lys) }
         return String(format: "%.0f тыс. c", c / 1_000)
     }
@@ -2386,6 +2638,7 @@ struct ContentView: View {
     @StateObject private var sim = SpaceSimulationController()
     @State private var showCatalog = false
     @State private var showInfo = false
+    @State private var selectedCategory: BodyCategory = .all
 
     var body: some View {
         ZStack {
@@ -2542,23 +2795,28 @@ struct ContentView: View {
                             .foregroundColor(.white)
 
                         if sim.isWalkingOnSurface {
-                            Button("ПРЫЖОК") {
-                                sim.evaJump()
-                            }
-                            .font(.system(size: 10, weight: .bold))
-                            .foregroundColor(.white)
-                            .padding(.horizontal, 9).padding(.vertical, 4)
-                            .background(Color.orange.opacity(0.85))
-                            .clipShape(Capsule())
+                            Text(sim.evaTempText)
+                                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                                .foregroundColor(.yellow.opacity(0.9))
 
-                            Button("В КОРАБЛЬ") {
-                                sim.boardShip()
+                            Text("КОРАБЛЬ: \(sim.evaShipDistanceText)")
+                                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                                .foregroundColor(.green.opacity(0.95))
+
+                            HStack(spacing: 4) {
+                                Image(systemName: "flame.fill")
+                                    .font(.system(size: 9))
+                                    .foregroundColor(sim.evaJetpackActive ? .orange : .cyan)
+                                GeometryReader { geo in
+                                    ZStack(alignment: .leading) {
+                                        Capsule().fill(Color.white.opacity(0.2))
+                                        Capsule()
+                                            .fill(sim.evaJetpackFuel > 0.25 ? Color.cyan : Color.red)
+                                            .frame(width: max(2, geo.size.width * CGFloat(sim.evaJetpackFuel)))
+                                    }
+                                }
+                                .frame(width: 44, height: 6)
                             }
-                            .font(.system(size: 10, weight: .bold))
-                            .foregroundColor(.white)
-                            .padding(.horizontal, 9).padding(.vertical, 4)
-                            .background(Color.green.opacity(0.85))
-                            .clipShape(Capsule())
                         } else if sim.isLanded {
                             Button("ВЫЙТИ") {
                                 sim.enterWalkingMode()
@@ -2610,7 +2868,7 @@ struct ContentView: View {
                 Spacer()
 
                 HStack(alignment: .bottom, spacing: 10) {
-                    VirtualFlightStick(label: sim.isWalkingOnSurface ? "ХОДЬБА" : (sim.isFreeCamera ? "WASD" : "РУЛЬ")) { pt in
+                    VirtualFlightStick(label: sim.isWalkingOnSurface ? (sim.evaSprinting ? "СПРИНТ" : "ХОДЬБА") : (sim.isFreeCamera ? "WASD" : "РУЛЬ")) { pt in
                         sim.stickInput = pt
                     }
 
@@ -2697,61 +2955,114 @@ struct ContentView: View {
                         .overlay(Capsule().stroke(Color.white.opacity(0.2), lineWidth: 1))
                         .clipShape(Capsule())
 
-                        HStack(spacing: 6) {
-                            // Кнопка логарифмической авто-скорости SpaceEngine
-                            Button(action: { sim.autoSpeed.toggle() }) {
-                                Text("АВТО")
-                                    .font(.system(size: 10, weight: .bold, design: .monospaced))
-                                    .lineLimit(1)
-                                    .fixedSize(horizontal: true, vertical: false)
-                                    .padding(.horizontal, 8).padding(.vertical, 6)
-                                    .background(sim.autoSpeed ? Color.cyan.opacity(0.45) : Color.white.opacity(0.14))
-                                    .clipShape(Capsule())
-                            }
-
-                            if !sim.autoSpeed {
-                                Button(action: { sim.speedIndex = max(0, sim.speedIndex - 1) }) {
-                                    Text("−")
-                                        .font(.system(size: 15, weight: .bold))
-                                        .frame(width: 28, height: 28)
-                                        .background(Color.white.opacity(0.18))
-                                        .clipShape(Circle())
+                        if sim.isWalkingOnSurface {
+                            HStack(spacing: 6) {
+                                Button(action: { sim.evaSprinting.toggle() }) {
+                                    Text("СПРИНТ")
+                                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                        .lineLimit(1)
+                                        .fixedSize(horizontal: true, vertical: false)
+                                        .padding(.horizontal, 9).padding(.vertical, 7)
+                                        .background(sim.evaSprinting ? Color.cyan.opacity(0.55) : Color.white.opacity(0.16))
+                                        .clipShape(Capsule())
                                 }
-                            }
 
-                            Text(sim.autoSpeed ? sim.autoSpeedLabel : sim.speedSteps[sim.speedIndex].label)
-                                .font(.system(size: 11, weight: .bold, design: .monospaced))
-                                .foregroundColor(sim.autoSpeed ? .cyan : .white)
+                                Button(action: {
+                                    if sim.evaJetpackFuel > 0.02 || sim.evaJetpackActive {
+                                        sim.evaJetpackActive.toggle()
+                                    }
+                                }) {
+                                    Text("РАНЕЦ \(Int(sim.evaJetpackFuel * 100))%")
+                                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                        .lineLimit(1)
+                                        .fixedSize(horizontal: true, vertical: false)
+                                        .padding(.horizontal, 9).padding(.vertical, 7)
+                                        .background(sim.evaJetpackActive ? Color.orange.opacity(0.78) : Color.white.opacity(0.16))
+                                        .clipShape(Capsule())
+                                }
+
+                                Button("ПРЫЖОК") {
+                                    sim.evaJump()
+                                }
+                                .font(.system(size: 10, weight: .bold))
                                 .lineLimit(1)
                                 .fixedSize(horizontal: true, vertical: false)
-                                .frame(minWidth: 84)
+                                .padding(.horizontal, 10).padding(.vertical, 7)
+                                .background(Color.orange.opacity(0.85))
+                                .clipShape(Capsule())
 
-                            if !sim.autoSpeed {
-                                Button(action: { sim.speedIndex = min(sim.speedSteps.count - 1, sim.speedIndex + 1) }) {
-                                    Text("+")
-                                        .font(.system(size: 15, weight: .bold))
-                                        .frame(width: 28, height: 28)
-                                        .background(Color.white.opacity(0.18))
-                                        .clipShape(Circle())
+                                Button("В КОРАБЛЬ") {
+                                    sim.boardShip()
                                 }
+                                .font(.system(size: 10, weight: .bold))
+                                .lineLimit(1)
+                                .fixedSize(horizontal: true, vertical: false)
+                                .padding(.horizontal, 10).padding(.vertical, 7)
+                                .background(Color.green.opacity(0.85))
+                                .clipShape(Capsule())
                             }
+                            .foregroundColor(.white)
+                            .padding(6)
+                            .background(Color.black.opacity(0.72))
+                            .overlay(Capsule().stroke(Color.cyan.opacity(0.35), lineWidth: 1))
+                            .clipShape(Capsule())
+                        } else {
+                            HStack(spacing: 6) {
+                                // Кнопка логарифмической авто-скорости SpaceEngine
+                                Button(action: { sim.autoSpeed.toggle() }) {
+                                    Text("АВТО")
+                                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                        .lineLimit(1)
+                                        .fixedSize(horizontal: true, vertical: false)
+                                        .padding(.horizontal, 8).padding(.vertical, 6)
+                                        .background(sim.autoSpeed ? Color.cyan.opacity(0.45) : Color.white.opacity(0.14))
+                                        .clipShape(Capsule())
+                                }
 
-                            Button("СТОП") {
-                                sim.throttle = 0
-                                sim.shipVelocityMetersPerSec = .zero
+                                if !sim.autoSpeed {
+                                    Button(action: { sim.speedIndex = max(0, sim.speedIndex - 1) }) {
+                                        Text("−")
+                                            .font(.system(size: 15, weight: .bold))
+                                            .frame(width: 28, height: 28)
+                                            .background(Color.white.opacity(0.18))
+                                            .clipShape(Circle())
+                                    }
+                                }
+
+                                Text(sim.autoSpeed ? sim.autoSpeedLabel : sim.speedSteps[sim.speedIndex].label)
+                                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                    .foregroundColor(sim.autoSpeed ? .cyan : .white)
+                                    .lineLimit(1)
+                                    .fixedSize(horizontal: true, vertical: false)
+                                    .frame(minWidth: 84)
+
+                                if !sim.autoSpeed {
+                                    Button(action: { sim.speedIndex = min(sim.speedSteps.count - 1, sim.speedIndex + 1) }) {
+                                        Text("+")
+                                            .font(.system(size: 15, weight: .bold))
+                                            .frame(width: 28, height: 28)
+                                            .background(Color.white.opacity(0.18))
+                                            .clipShape(Circle())
+                                    }
+                                }
+
+                                Button("СТОП") {
+                                    sim.throttle = 0
+                                    sim.shipVelocityMetersPerSec = .zero
+                                }
+                                .font(.system(size: 10, weight: .bold))
+                                .lineLimit(1)
+                                .fixedSize(horizontal: true, vertical: false)
+                                .padding(.horizontal, 10).padding(.vertical, 6)
+                                .background(Color.red.opacity(0.82))
+                                .clipShape(Capsule())
                             }
-                            .font(.system(size: 10, weight: .bold))
-                            .lineLimit(1)
-                            .fixedSize(horizontal: true, vertical: false)
-                            .padding(.horizontal, 10).padding(.vertical, 6)
-                            .background(Color.red.opacity(0.82))
+                            .foregroundColor(.white)
+                            .padding(6)
+                            .background(Color.black.opacity(0.72))
+                            .overlay(Capsule().stroke(Color.white.opacity(0.2), lineWidth: 1))
                             .clipShape(Capsule())
                         }
-                        .foregroundColor(.white)
-                        .padding(6)
-                        .background(Color.black.opacity(0.72))
-                        .overlay(Capsule().stroke(Color.white.opacity(0.2), lineWidth: 1))
-                        .clipShape(Capsule())
                     }
                 }
                 .padding(.horizontal, 12)
@@ -2776,7 +3087,9 @@ struct ContentView: View {
                     Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 4) {
                         GridRow {
                             Text("Радиус:").foregroundColor(.gray)
-                            Text(String(format: "%.0f км", b.radiusMeters / 1_000)).bold()
+                            Text(b.radiusMeters >= 0.01 * UniverseCatalog.ly
+                                 ? SpaceSimulationController.formatDistance(b.radiusMeters)
+                                 : String(format: "%.0f км", b.radiusMeters / 1_000)).bold()
                         }
                         GridRow {
                             Text("Гравитация:").foregroundColor(.gray)
@@ -2795,9 +3108,12 @@ struct ContentView: View {
                             Text(String(format: "%.1f°", b.axialTiltRad * 180.0 / .pi)).bold()
                         }
                         if b.orbitalPeriodSeconds > 0 {
+                            let days = b.orbitalPeriodSeconds / 86_400
                             GridRow {
                                 Text("Год на орбите:").foregroundColor(.gray)
-                                Text(String(format: "%.1f земн. дн.", b.orbitalPeriodSeconds / 86_400)).bold()
+                                Text(days > 3_650
+                                     ? String(format: "%.1f земн. лет", days / 365.25)
+                                     : String(format: "%.1f земн. дн.", days)).bold()
                             }
                         }
                     }
@@ -2847,16 +3163,35 @@ struct ContentView: View {
             }
 
             if showCatalog {
+                let filteredBodies = UniverseCatalog.bodies.filter {
+                    selectedCategory == .all || $0.category == selectedCategory
+                }
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
-                        Text("Астрономический каталог 1:1")
+                        Text("Астрономический каталог 1:1 (\(filteredBodies.count))")
                             .font(.headline)
                         Spacer()
                         Button("Закрыть") { showCatalog = false }
                     }
+
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 6) {
+                            ForEach(BodyCategory.allCases) { cat in
+                                Button(cat.rawValue) {
+                                    selectedCategory = cat
+                                }
+                                .font(.system(size: 11, weight: .bold))
+                                .padding(.horizontal, 10).padding(.vertical, 5)
+                                .background(selectedCategory == cat ? Color.cyan.opacity(0.55) : Color.white.opacity(0.12))
+                                .overlay(Capsule().stroke(Color.white.opacity(0.22), lineWidth: 1))
+                                .clipShape(Capsule())
+                            }
+                        }
+                    }
+
                     ScrollView {
                         VStack(spacing: 6) {
-                            ForEach(UniverseCatalog.bodies) { body in
+                            ForEach(filteredBodies) { body in
                                 HStack(spacing: 8) {
                                     VStack(alignment: .leading, spacing: 2) {
                                         Text(body.name).bold()
@@ -2902,7 +3237,7 @@ struct ContentView: View {
                 }
                 .foregroundColor(.white)
                 .padding()
-                .frame(maxWidth: 440, maxHeight: 290)
+                .frame(maxWidth: 460, maxHeight: 300)
                 .background(Color.black.opacity(0.92))
                 .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.cyan.opacity(0.4), lineWidth: 1))
                 .cornerRadius(16)

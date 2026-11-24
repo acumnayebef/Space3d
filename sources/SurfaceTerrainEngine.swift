@@ -146,21 +146,23 @@ final class SurfaceTerrainEngine {
         return t * t * (3.0 - 2.0 * t)
     }
 
-    // MARK: - Unified Planetary Terrain Sampler
+    // MARK: - Unified Planetary Terrain Sampler (Including Human-Scale Hills & Craters)
 
     static func sampleTerrain(localDir: SIMD3<Double>, body: CelestialBody) -> TerrainSample {
         let dir = simd_length_squared(localDir) > 1e-12 ? simd_normalize(localDir) : SIMD3<Double>(0, 1, 0)
         let lat = abs(dir.y)
+        let scale800m = max(12.0, body.radiusMeters / 800.0)
+        let scale140m = max(60.0, body.radiusMeters / 140.0)
 
-        switch body.id {
-        case "earth":
+        if body.isHabitableWorld {
             let n = fbm3D(dir * 3.6, octaves: 4)
             let warp = fbm3D(dir * 2.2 + SIMD3<Double>(4.1, 1.7, 8.3), octaves: 3) * 0.25
             let elev = n + warp - 0.12
             let detail = fbm3D(dir * 18.0, octaves: 3)
 
             if lat + detail * 0.10 > 0.84 {
-                let iceHeight = 60.0 + detail * 480.0
+                let localHills = (fbm3D(dir * scale800m, octaves: 3) - 0.45) * 90.0 + (valueNoise3D(dir * scale140m) - 0.5) * 18.0
+                let iceHeight = max(8.0, 60.0 + detail * 480.0 + localHills)
                 return TerrainSample(
                     heightMeters: iceHeight,
                     color: SIMD3<Float>(0.76, 0.80, 0.85),
@@ -184,29 +186,55 @@ final class SurfaceTerrainEngine {
             let mountainMask = smoothstep(0.18, 0.72, landFrac)
             let ridges = ridgedFbm3D(dir * 28.0, octaves: 4)
             let hills = fbm3D(dir * 140.0, octaves: 3)
-            let height = landFrac * 1_200.0 + ridges * mountainMask * 4_400.0 + hills * 480.0
+            let localHills = (fbm3D(dir * scale800m, octaves: 3) - 0.45) * 140.0
+            let microMounds = (valueNoise3D(dir * scale140m) - 0.5) * 26.0
+            let height = max(2.0, landFrac * 1_200.0 + ridges * mountainMask * 4_400.0 + hills * 480.0 + localHills + microMounds)
 
             let sand = SIMD3<Float>(0.48, 0.42, 0.28)
             let forest = SIMD3<Float>(0.04, 0.16, 0.05)
             let meadow = SIMD3<Float>(0.17, 0.24, 0.09)
-            let aridHighland = SIMD3<Float>(0.38, 0.30, 0.19)
+            let aridHighland = SIMD3<Float>(0.36, 0.29, 0.18)
             let rock = SIMD3<Float>(0.22, 0.21, 0.20)
             let snow = SIMD3<Float>(0.76, 0.80, 0.85)
 
+            let isCold = (body.id == "proxima_b" || body.id == "kepler186f")
             let arid = smoothstep(0.06, 0.30, abs(lat - 0.26)) * smoothstep(0.18, 0.78, detail)
             var col = mix(aridHighland, mix(meadow, forest, detail), arid)
-            col = mix(sand, col, smoothstep(8.0, 60.0, height))
+            if isCold {
+                col = mix(col, SIMD3<Float>(0.22, 0.14, 0.12), 0.32)
+            }
+            col = mix(sand, col, smoothstep(8.0, 55.0, height))
             col = mix(col, rock, smoothstep(1_150.0, 2_200.0, height))
             col = mix(col, snow, smoothstep(2_800.0, 3_900.0, height + lat * 680.0))
 
             return TerrainSample(heightMeters: height, color: col, isWater: false)
+        }
 
-        case "mars":
+        if body.isIcyWorld || body.id == "trappist1f" || body.id == "trappist1g" {
+            let base = fbm3D(dir * 4.0, octaves: 4)
+            let ridges = ridgedFbm3D(dir * 20.0, octaves: 4)
+            let localRidges = (ridgedFbm3D(dir * scale800m, octaves: 3) - 0.35) * 140.0
+            let craters = craterField3D(dir * 26.0) * 900.0
+            let micro = (valueNoise3D(dir * scale140m) - 0.5) * 20.0
+            let height = (base - 0.48) * 1_800.0 + ridges * 1_600.0 + craters + localRidges + micro
+
+            let crevasse = SIMD3<Float>(0.20, 0.34, 0.48)
+            let iceSheet = SIMD3<Float>(0.54, 0.65, 0.74)
+            let frostPeak = SIMD3<Float>(0.74, 0.80, 0.86)
+            var col = mix(crevasse, iceSheet, smoothstep(-700.0, 900.0, height))
+            col = mix(col, frostPeak, smoothstep(1_000.0, 2_400.0, height))
+            return TerrainSample(heightMeters: height, color: col, isWater: false)
+        }
+
+        switch body.id {
+        case "mars", "trappist1d":
             let base = fbm3D(dir * 3.8, octaves: 4)
             let ridges = ridgedFbm3D(dir * 19.0, octaves: 4)
             let micro = fbm3D(dir * 110.0, octaves: 3)
             let craters = craterField3D(dir * 34.0)
-            let height = (base - 0.48) * 3_800.0 + ridges * 3_200.0 + craters * 950.0 + (micro - 0.45) * 420.0
+            let localRidges = (ridgedFbm3D(dir * scale800m, octaves: 3) - 0.35) * 160.0
+            let localBumps = (valueNoise3D(dir * scale140m) - 0.5) * 22.0
+            let height = (base - 0.48) * 3_800.0 + ridges * 3_200.0 + craters * 950.0 + (micro - 0.45) * 420.0 + localRidges + localBumps
 
             let darkBasalt = SIMD3<Float>(0.18, 0.07, 0.04)
             let terracotta = SIMD3<Float>(0.44, 0.18, 0.09)
@@ -218,39 +246,46 @@ final class SurfaceTerrainEngine {
             }
             return TerrainSample(heightMeters: height, color: col, isWater: false)
 
-        case "moon", "mercury":
+        case "moon", "mercury", "ceres", "phobos":
             let maria = fbm3D(dir * 3.2, octaves: 4)
             let rough = fbm3D(dir * 26.0, octaves: 3)
             let largeCraters = craterField3D(dir * 16.0)
             let smallCraters = craterField3D(dir * 52.0)
-            let height = (maria - 0.48) * 2_400.0 + (rough - 0.45) * 850.0 + largeCraters * 2_200.0 + smallCraters * 650.0
+            let localCraters = craterField3D(dir * scale800m) * 110.0
+            let microBumps = (valueNoise3D(dir * scale140m) - 0.5) * 18.0
+            let ampScale = (body.id == "phobos") ? 0.25 : 1.0
+            let height = ((maria - 0.48) * 2_400.0 + (rough - 0.45) * 850.0 + largeCraters * 2_200.0 + smallCraters * 650.0) * ampScale + localCraters + microBumps
 
-            let isMercury = (body.id == "mercury")
+            let isMercury = (body.id == "mercury" || body.id == "phobos")
             let darkFloor = isMercury ? SIMD3<Float>(0.12, 0.11, 0.10) : SIMD3<Float>(0.11, 0.115, 0.125)
             let midRegolith = isMercury ? SIMD3<Float>(0.26, 0.24, 0.22) : SIMD3<Float>(0.24, 0.245, 0.255)
             let brightEjecta = isMercury ? SIMD3<Float>(0.42, 0.39, 0.36) : SIMD3<Float>(0.44, 0.445, 0.46)
 
-            var col = mix(darkFloor, midRegolith, smoothstep(-1_200.0, 1_400.0, height))
+            var col = mix(darkFloor, midRegolith, smoothstep(-1_200.0 * ampScale, 1_400.0 * ampScale, height))
             let rimHighlight = max(0.0, largeCraters + smallCraters * 0.5)
             col = mix(col, brightEjecta, smoothstep(0.05, 0.42, rimHighlight + (rough - 0.45) * 0.35))
             return TerrainSample(heightMeters: height, color: col, isWater: false)
 
-        case "venus":
+        case "venus", "trappist1b", "titan", "io":
             let plains = fbm3D(dir * 4.2, octaves: 4)
             let volcanic = ridgedFbm3D(dir * 22.0, octaves: 4)
             let detail = fbm3D(dir * 95.0, octaves: 3)
-            let height = (plains - 0.48) * 2_800.0 + volcanic * 2_800.0 + (detail - 0.45) * 380.0
+            let localRidges = (ridgedFbm3D(dir * scale800m, octaves: 3) - 0.35) * 155.0
+            let localBumps = (valueNoise3D(dir * scale140m) - 0.5) * 22.0
+            let height = (plains - 0.48) * 2_800.0 + volcanic * 2_800.0 + (detail - 0.45) * 380.0 + localRidges + localBumps
 
-            let basalt = SIMD3<Float>(0.16, 0.10, 0.06)
-            let sulfur = SIMD3<Float>(0.42, 0.30, 0.14)
-            let peak = SIMD3<Float>(0.56, 0.42, 0.22)
+            let isIo = (body.id == "io")
+            let basalt = isIo ? SIMD3<Float>(0.22, 0.09, 0.03) : SIMD3<Float>(0.16, 0.10, 0.06)
+            let sulfur = isIo ? SIMD3<Float>(0.68, 0.54, 0.12) : SIMD3<Float>(0.42, 0.28, 0.14)
+            let peak = isIo ? SIMD3<Float>(0.80, 0.32, 0.08) : SIMD3<Float>(0.56, 0.42, 0.22)
             var col = mix(basalt, sulfur, smoothstep(-400.0, 1_600.0, height))
             col = mix(col, peak, smoothstep(1_800.0, 3_900.0, height))
             return TerrainSample(heightMeters: height, color: col, isWater: false)
 
         default:
             let base = fbm3D(dir * 5.0, octaves: 4)
-            let height = (base - 0.48) * 2_500.0
+            let localCraters = craterField3D(dir * scale800m) * 100.0
+            let height = (base - 0.48) * 2_500.0 + localCraters
             let col = SIMD3<Float>(
                 Float((body.colorHex >> 16) & 0xFF) / 255.0 * 0.55,
                 Float((body.colorHex >> 8) & 0xFF) / 255.0 * 0.55,
@@ -260,7 +295,7 @@ final class SurfaceTerrainEngine {
         }
     }
 
-    // MARK: - Scenic Approach Direction (Low-Angle Sunlight + Mountainous Land on Earth)
+    // MARK: - Scenic Approach Direction (Low-Angle Sunlight + Lush Rolling Land)
 
     static func findScenicApproachDirection(
         for body: CelestialBody,
@@ -275,7 +310,7 @@ final class SurfaceTerrainEngine {
         let up = simd_normalize(simd_cross(toSun, right))
         let defaultDir = simd_normalize(toSun * 0.46 + right * 0.84 + up * 0.26)
 
-        guard body.id == "earth" else {
+        guard body.isHabitableWorld else {
             return defaultDir
         }
 
@@ -285,9 +320,11 @@ final class SurfaceTerrainEngine {
         for i in 0..<24 {
             let az = Double(i) * (.pi / 12.0)
             let candidate = simd_normalize(toSun * 0.46 + (right * cos(az) + up * sin(az)) * 0.88)
-            let sample = sampleTerrain(localDir: invPlanetRot.act(candidate), body: body)
+            let localDir = invPlanetRot.act(candidate)
+            let lat = abs(localDir.y)
+            let sample = sampleTerrain(localDir: localDir, body: body)
             if !sample.isWater {
-                if sample.heightMeters > 250.0 && sample.heightMeters < 2_200.0 {
+                if lat >= 0.20 && lat <= 0.68 && sample.heightMeters > 220.0 && sample.heightMeters < 1_400.0 {
                     return candidate
                 }
                 if sample.heightMeters > fallbackMaxHeight {
@@ -338,7 +375,10 @@ final class SurfaceTerrainEngine {
         let gridN = 73
         let vertexCount = gridN * gridN
         let horizonDist = sqrt(max(1.0, 2.0 * body.radiusMeters * max(50.0, altitudeMeters)))
-        let patchHalfExtent = min(body.radiusMeters * 0.36, max(22_000.0, horizonDist * 1.05))
+        let isLowAlt = altitudeMeters < 1_500.0
+        let patchHalfExtent = isLowAlt
+            ? min(body.radiusMeters * 0.30, max(12_000.0, horizonDist * 1.15))
+            : min(body.radiusMeters * 0.36, max(22_000.0, horizonDist * 1.05))
 
         var positionsSIMD = [SIMD3<Float>](repeating: .zero, count: vertexCount)
         var colorFloats = [Float](repeating: 0.5, count: vertexCount * 3)
@@ -346,11 +386,15 @@ final class SurfaceTerrainEngine {
 
         for iz in 0..<gridN {
             let tz = (Double(iz) / Double(gridN - 1)) * 2.0 - 1.0
-            let v = (tz >= 0 ? 1.0 : -1.0) * (0.12 * abs(tz) + 0.88 * tz * tz)
+            let v = isLowAlt
+                ? ((tz >= 0 ? 1.0 : -1.0) * (0.04 * abs(tz) + 0.96 * abs(tz * tz * tz)))
+                : ((tz >= 0 ? 1.0 : -1.0) * (0.12 * abs(tz) + 0.88 * tz * tz))
 
             for ix in 0..<gridN {
                 let tx = (Double(ix) / Double(gridN - 1)) * 2.0 - 1.0
-                let u = (tx >= 0 ? 1.0 : -1.0) * (0.12 * abs(tx) + 0.88 * tx * tx)
+                let u = isLowAlt
+                    ? ((tx >= 0 ? 1.0 : -1.0) * (0.04 * abs(tx) + 0.96 * abs(tx * tx * tx)))
+                    : ((tx >= 0 ? 1.0 : -1.0) * (0.12 * abs(tx) + 0.88 * tx * tx))
 
                 let offset = east * (u * patchHalfExtent) + north * (v * patchHalfExtent)
                 let dirWorld = simd_normalize(upWorld * body.radiusMeters + offset)
@@ -358,7 +402,7 @@ final class SurfaceTerrainEngine {
                 let sample = sampleTerrain(localDir: localDir, body: body)
 
                 let rawHeight = sample.isWater ? (sample.heightMeters - 28.0) : sample.heightMeters
-                let vertexHeight = (body.id == "earth") ? max(-120.0, rawHeight) : sample.heightMeters
+                let vertexHeight = body.isHabitableWorld ? max(-120.0, rawHeight) : sample.heightMeters
                 let ptWorld = bodyPos + dirWorld * (body.radiusMeters + vertexHeight)
                 let (scenePos, _) = compress(ptWorld - anchorWorld)
 
@@ -434,7 +478,7 @@ final class SurfaceTerrainEngine {
         let terrainMat = SCNMaterial()
         terrainMat.lightingModel = .physicallyBased
         terrainMat.diffuse.contents = whitePixel
-        terrainMat.roughness.contents = 0.92
+        terrainMat.roughness.contents = body.isIcyWorld ? 0.44 : 0.92
         terrainMat.metalness.contents = 0.02
         terrainMat.shaderModifiers = [.surface: terrainShaderModifier(for: body)]
 
@@ -442,7 +486,7 @@ final class SurfaceTerrainEngine {
         terrainGeo.materials = [terrainMat]
 
         var oceanGeo: SCNGeometry? = nil
-        if body.id == "earth" {
+        if body.isHabitableWorld {
             oceanGeo = buildEarthOceanGeometry(
                 body: body,
                 bodyPos: bodyPos,
@@ -594,6 +638,226 @@ final class SurfaceTerrainEngine {
         return geo
     }
 
+    // MARK: - Procedural 3D Surface Props (Trees, Bushes, Rocks, Ice Spires)
+
+    static func buildSurfaceProps(
+        body: CelestialBody,
+        bodyPos: SIMD3<Double>,
+        anchorWorld: SIMD3<Double>,
+        planetRot: simd_quatd,
+        invPlanetRot: simd_quatd,
+        clearCenterWorld: SIMD3<Double>?
+    ) -> SCNNode {
+        let container = SCNNode()
+        let rawUp = anchorWorld - bodyPos
+        let upWorld = simd_length_squared(rawUp) > 1e-12 ? simd_normalize(rawUp) : SIMD3<Double>(0, 1, 0)
+        let localAnchor = invPlanetRot.act(upWorld) * body.radiusMeters
+
+        let ax = abs(localAnchor.x)
+        let ay = abs(localAnchor.y)
+        let az = abs(localAnchor.z)
+        let dominantAxis = (ay >= ax && ay >= az) ? 1 : ((ax >= ay && ax >= az) ? 0 : 2)
+
+        let u0: Double
+        let v0: Double
+        let domSign: Double
+        switch dominantAxis {
+        case 1:
+            u0 = localAnchor.x
+            v0 = localAnchor.z
+            domSign = localAnchor.y >= 0 ? 1.0 : -1.0
+        case 0:
+            u0 = localAnchor.z
+            v0 = localAnchor.y
+            domSign = localAnchor.x >= 0 ? 1.0 : -1.0
+        default:
+            u0 = localAnchor.x
+            v0 = localAnchor.y
+            domSign = localAnchor.z >= 0 ? 1.0 : -1.0
+        }
+
+        // Shared materials & geometries
+        let trunkMat = SCNMaterial()
+        trunkMat.lightingModel = .physicallyBased
+        trunkMat.diffuse.contents = UIColor(red: 0.24, green: 0.16, blue: 0.09, alpha: 1.0)
+        trunkMat.roughness.contents = 0.94
+
+        let pineMat = SCNMaterial()
+        pineMat.lightingModel = .physicallyBased
+        pineMat.diffuse.contents = body.id == "earth"
+            ? UIColor(red: 0.07, green: 0.24, blue: 0.08, alpha: 1.0)
+            : UIColor(red: 0.14, green: 0.26, blue: 0.16, alpha: 1.0)
+        pineMat.roughness.contents = 0.88
+
+        let bushMat = SCNMaterial()
+        bushMat.lightingModel = .physicallyBased
+        bushMat.diffuse.contents = UIColor(red: 0.11, green: 0.29, blue: 0.10, alpha: 1.0)
+        bushMat.roughness.contents = 0.90
+
+        let rockMat = SCNMaterial()
+        rockMat.lightingModel = .physicallyBased
+        switch body.id {
+        case "mars", "trappist1d":
+            rockMat.diffuse.contents = UIColor(red: 0.42, green: 0.18, blue: 0.10, alpha: 1.0)
+        case "moon", "mercury", "ceres", "phobos":
+            rockMat.diffuse.contents = UIColor(red: 0.22, green: 0.23, blue: 0.25, alpha: 1.0)
+        case "venus", "trappist1b", "io":
+            rockMat.diffuse.contents = UIColor(red: 0.24, green: 0.16, blue: 0.09, alpha: 1.0)
+        case "titan":
+            rockMat.diffuse.contents = UIColor(red: 0.48, green: 0.30, blue: 0.12, alpha: 1.0)
+        default:
+            rockMat.diffuse.contents = UIColor(red: 0.32, green: 0.31, blue: 0.29, alpha: 1.0)
+        }
+        rockMat.roughness.contents = 0.94
+
+        let iceMat = SCNMaterial()
+        iceMat.lightingModel = .physicallyBased
+        iceMat.diffuse.contents = UIColor(red: 0.64, green: 0.82, blue: 0.94, alpha: 0.92)
+        iceMat.roughness.contents = 0.25
+        iceMat.metalness.contents = 0.1
+
+        let trunkGeo = SCNCylinder(radius: 0.22, height: 2.2)
+        trunkGeo.materials = [trunkMat]
+        let coneLowGeo = SCNCone(topRadius: 0.18, bottomRadius: 1.65, height: 2.6)
+        coneLowGeo.materials = [pineMat]
+        let coneMidGeo = SCNCone(topRadius: 0.12, bottomRadius: 1.28, height: 2.3)
+        coneMidGeo.materials = [pineMat]
+        let coneTopGeo = SCNCone(topRadius: 0.03, bottomRadius: 0.88, height: 1.9)
+        coneTopGeo.materials = [pineMat]
+
+        let bushGeo = SCNSphere(radius: 0.95)
+        bushGeo.segmentCount = 12
+        bushGeo.materials = [bushMat]
+
+        let boulderGeo = SCNBox(width: 1.4, height: 0.95, length: 1.25, chamferRadius: 0.34)
+        boulderGeo.materials = [rockMat]
+
+        let slabGeo = SCNBox(width: 2.0, height: 0.55, length: 1.7, chamferRadius: 0.18)
+        slabGeo.materials = [rockMat]
+
+        let spireGeo = SCNPyramid(width: 1.1, height: 3.4, length: 1.1)
+        spireGeo.materials = [iceMat]
+
+        let cellSize = 35.0
+        let cx0 = Int(floor(u0 / cellSize))
+        let cz0 = Int(floor(v0 / cellSize))
+        let R = body.radiusMeters
+        let R2 = R * R
+
+        for dz in -12...12 {
+            for dx in -12...12 {
+                let cx = cx0 &+ dx
+                let cz = cz0 &+ dz
+
+                let prob = hash31(cx, cz, dominantAxis, seed: 404)
+                let spawnThreshold = body.isHabitableWorld ? 0.72 : 0.78
+                if prob < spawnThreshold { continue }
+
+                let h1 = hash31(cx, cz, dominantAxis, seed: 509)
+                let h2 = hash31(cx, cz, dominantAxis, seed: 613)
+                let h3 = hash31(cx, cz, dominantAxis, seed: 719)
+                let h4 = hash31(cx, cz, dominantAxis, seed: 823)
+
+                let u = (Double(cx) + 0.15 + 0.70 * h1) * cellSize
+                let v = (Double(cz) + 0.15 + 0.70 * h2) * cellSize
+                let comp2 = R2 - u * u - v * v
+                if comp2 <= 100.0 { continue }
+                let w = domSign * sqrt(comp2)
+
+                let localDir: SIMD3<Double>
+                switch dominantAxis {
+                case 1: localDir = simd_normalize(SIMD3<Double>(u, w, v))
+                case 0: localDir = simd_normalize(SIMD3<Double>(w, v, u))
+                default: localDir = simd_normalize(SIMD3<Double>(u, v, w))
+                }
+
+                let sample = sampleTerrain(localDir: localDir, body: body)
+                if sample.isWater { continue }
+
+                let dirWorld = planetRot.act(localDir)
+                let propWorld = bodyPos + dirWorld * (R + sample.heightMeters)
+                let distAnchor = simd_length(propWorld - anchorWorld)
+                if distAnchor < 14.0 || distAnchor > 430.0 { continue }
+
+                if let clearPos = clearCenterWorld, simd_length(propWorld - clearPos) < 14.0 {
+                    continue
+                }
+
+                let propNode = SCNNode()
+                let relPos = propWorld - anchorWorld
+                propNode.simdPosition = SIMD3<Float>(Float(relPos.x), Float(relPos.y), Float(relPos.z))
+
+                let upF = SIMD3<Float>(Float(dirWorld.x), Float(dirWorld.y), Float(dirWorld.z))
+                let alignQ = simd_quatf(from: SIMD3<Float>(0, 1, 0), to: simd_normalize(upF))
+                let yawQ = simd_quatf(angle: Float(h3 * 2.0 * .pi), axis: SIMD3<Float>(0, 1, 0))
+                propNode.simdOrientation = simd_normalize(alignQ * yawQ)
+
+                if body.isHabitableWorld && sample.heightMeters > 15.0 && sample.heightMeters < 1_800.0 {
+                    if h4 < 0.56 {
+                        // Многоярусная сосна/ель (4–10 м)
+                        let s = Float(0.85 + h3 * 0.85)
+                        let tNode = SCNNode(geometry: trunkGeo)
+                        tNode.position = SCNVector3(0, 1.0, 0)
+                        propNode.addChildNode(tNode)
+
+                        let c1 = SCNNode(geometry: coneLowGeo)
+                        c1.position = SCNVector3(0, 2.7, 0)
+                        propNode.addChildNode(c1)
+
+                        let c2 = SCNNode(geometry: coneMidGeo)
+                        c2.position = SCNVector3(0, 4.1, 0)
+                        propNode.addChildNode(c2)
+
+                        let c3 = SCNNode(geometry: coneTopGeo)
+                        c3.position = SCNVector3(0, 5.4, 0)
+                        propNode.addChildNode(c3)
+
+                        propNode.simdScale = SIMD3<Float>(repeating: s)
+                    } else if h4 < 0.80 {
+                        // Пышный кустарник
+                        let bNode = SCNNode(geometry: bushGeo)
+                        bNode.position = SCNVector3(0, 0.52, 0)
+                        bNode.scale = SCNVector3(Float(1.1 + h1 * 0.7), Float(0.75 + h2 * 0.4), Float(1.0 + h3 * 0.6))
+                        propNode.addChildNode(bNode)
+                    } else {
+                        // Гранитный валун
+                        let rNode = SCNNode(geometry: boulderGeo)
+                        rNode.position = SCNVector3(0, 0.36, 0)
+                        let s = Float(0.8 + h3 * 1.9)
+                        propNode.simdScale = SIMD3<Float>(s, s * 0.82, s * 1.05)
+                        propNode.addChildNode(rNode)
+                    }
+                } else if body.isIcyWorld {
+                    if h4 < 0.52 {
+                        let spNode = SCNNode(geometry: spireGeo)
+                        spNode.position = SCNVector3(0, 1.4, 0)
+                        let s = Float(0.75 + h3 * 1.4)
+                        propNode.simdScale = SIMD3<Float>(s * 0.9, s * 1.2, s * 0.9)
+                        propNode.addChildNode(spNode)
+                    } else {
+                        let rNode = SCNNode(geometry: boulderGeo)
+                        rNode.position = SCNVector3(0, 0.36, 0)
+                        let s = Float(0.7 + h3 * 1.6)
+                        propNode.simdScale = SIMD3<Float>(s, s * 0.75, s)
+                        propNode.addChildNode(rNode)
+                    }
+                } else {
+                    // Луна, Марс, Меркурий, Венера, Ио, Титан: валуны и каменные плиты
+                    let geo = (h4 < 0.65) ? boulderGeo : slabGeo
+                    let rNode = SCNNode(geometry: geo)
+                    rNode.position = SCNVector3(0, geo === boulderGeo ? 0.34 : 0.20, 0)
+                    let s = Float(0.65 + h3 * 2.2)
+                    propNode.simdScale = SIMD3<Float>(s, s * Float(0.65 + h1 * 0.45), s * Float(0.85 + h2 * 0.35))
+                    propNode.addChildNode(rNode)
+                }
+
+                container.addChildNode(propNode)
+            }
+        }
+
+        return container
+    }
+
     private static func appendOutwardTriangle(
         _ i0: Int32,
         _ i1: Int32,
@@ -621,11 +885,16 @@ final class SurfaceTerrainEngine {
 
     static func terrainShaderModifier(for body: CelestialBody) -> String {
         let mode: Int
-        switch body.id {
-        case "earth": mode = 1
-        case "mars": mode = 2
-        case "venus": mode = 3
-        default: mode = 4
+        if body.isHabitableWorld {
+            mode = 1
+        } else if body.id == "mars" || body.id == "trappist1d" {
+            mode = 2
+        } else if body.id == "venus" || body.id == "trappist1b" || body.id == "titan" || body.id == "io" {
+            mode = 3
+        } else if body.isIcyWorld || body.id == "trappist1f" || body.id == "trappist1g" {
+            mode = 5
+        } else {
+            mode = 4
         }
 
         return """
@@ -715,16 +984,17 @@ final class SurfaceTerrainEngine {
             float ridge = ridged2D(km * 0.75);
             float micro = fbm2D(km * 6.5) * medFade + 0.5 * (1.0 - medFade);
             float fine = noise2D(km * 35.0) * fineFade + 0.5 * (1.0 - fineFade);
+            float grass = noise2D(km * 120.0) * fineFade + 0.5 * (1.0 - fineFade);
 
             float cliff = smoothstep(0.45, 0.82, ridge);
             col = mix(baseCol * (0.72 + 0.55 * macro), vec3(0.24, 0.22, 0.20), cliff * 0.45);
-            col *= (0.82 + 0.34 * micro + 0.12 * (fine - 0.5));
+            col *= (0.80 + 0.32 * micro + 0.14 * (fine - 0.5) + 0.10 * (grass - 0.5));
 
             float cloudSh = smoothstep(0.56, 0.76, fbm2D(km * 0.06 + vec2(u_time * 0.01, 0.0)));
             col *= (1.0 - cloudSh * 0.32);
 
-            microH = ridge * 0.55 + micro * 0.30 * medFade + fine * 0.15 * fineFade;
-            bumpStrength = 20.0;
+            microH = ridge * 0.50 + micro * 0.25 * medFade + fine * 0.15 * fineFade + grass * 0.10 * fineFade;
+            bumpStrength = 22.0;
             rough = mix(0.88, 0.74, cliff);
         } else if (tMode == 2) {
             float cr = crater2D(km * 0.35);
@@ -750,6 +1020,17 @@ final class SurfaceTerrainEngine {
             microH = ridge * 0.50 + frac * 0.30 + micro * 0.20 * medFade;
             bumpStrength = 22.0;
             rough = 0.86;
+        } else if (tMode == 5) {
+            float crev = ridged2D(km * 1.4);
+            float micro = fbm2D(km * 8.0) * medFade + 0.5 * (1.0 - medFade);
+            float frost = noise2D(km * 48.0) * fineFade + 0.5 * (1.0 - fineFade);
+
+            col = mix(baseCol * (0.82 + 0.30 * micro), vec3(0.24, 0.44, 0.62), smoothstep(0.62, 0.92, crev) * 0.65);
+            col += vec3(0.08, 0.10, 0.12) * (frost - 0.5);
+
+            microH = crev * 0.55 + micro * 0.30 * medFade + frost * 0.15 * fineFade;
+            bumpStrength = 18.0;
+            rough = mix(0.32, 0.60, crev);
         } else {
             float cBig = crater2D(km * 0.12);
             float cMed = crater2D(km * 0.55) * medFade;
@@ -774,16 +1055,46 @@ final class SurfaceTerrainEngine {
         """
     }
 
-    // MARK: - Interior Atmospheric Sky Dome GLSL Shader
+    // MARK: - Interior Atmospheric Sky Dome GLSL Shader (With Volumetric Drifting Clouds)
 
     static func skyDomeShaderModifier() -> String {
         return """
         uniform vec3 sunDirView;
         uniform vec3 upDirView;
+        uniform vec3 eastDirView;
         uniform vec3 zenithCol;
         uniform vec3 horizonCol;
         uniform vec3 sunsetCol;
         uniform float atmoDensity;
+        uniform float cloudAmount;
+
+        float hash21(vec2 p) {
+            p = fract(p * vec2(127.1, 311.7));
+            p += dot(p, p + 34.5);
+            return fract(p.x * p.y);
+        }
+
+        float noise2D(vec2 p) {
+            vec2 i = floor(p);
+            vec2 f = fract(p);
+            f = f * f * (3.0 - 2.0 * f);
+            float a = hash21(i);
+            float b = hash21(i + vec2(1.0, 0.0));
+            float c = hash21(i + vec2(0.0, 1.0));
+            float d = hash21(i + vec2(1.0, 1.0));
+            return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+        }
+
+        float cloudFbm(vec2 p) {
+            float v = 0.0;
+            float a = 0.5;
+            for (int i = 0; i < 4; i++) {
+                v += a * noise2D(p);
+                p = p * 2.06 + vec2(13.7, 9.2);
+                a *= 0.49;
+            }
+            return v;
+        }
 
         #pragma body
         vec3 rayDir = normalize(-_surface.view);
@@ -802,8 +1113,25 @@ final class SurfaceTerrainEngine {
         sky = mix(sky, sunsetCol, twilight * (0.45 + 0.55 * horizonFactor));
         sky += mix(horizonCol, sunsetCol, twilight) * sunGlow * (0.35 + 0.65 * dayFactor);
 
+        float cloudAlphaBoost = 0.0;
+        if (elev > 0.01 && cloudAmount > 0.01) {
+            vec3 eastV = normalize(eastDirView);
+            vec3 northV = normalize(cross(upV, eastV));
+            vec2 cUV = vec2(dot(rayDir, eastV), dot(rayDir, northV)) / (elev + 0.16);
+            float c1 = cloudFbm(cUV * 1.1 + vec2(u_time * 0.012, u_time * 0.006));
+            float c2 = cloudFbm(cUV * 2.6 - vec2(u_time * 0.018, -u_time * 0.010));
+            float cVal = c1 * 0.68 + c2 * 0.32;
+            float cMask = smoothstep(0.52 - cloudAmount * 0.16, 0.78, cVal) * smoothstep(0.01, 0.22, elev) * cloudAmount;
+
+            vec3 cloudLit = mix(vec3(0.95, 0.97, 1.0), sunsetCol * 1.15, twilight * 0.70);
+            vec3 cloudShadow = mix(horizonCol * 0.62, vec3(0.42, 0.46, 0.56), 0.5);
+            vec3 cloudCol = mix(cloudShadow, cloudLit, smoothstep(0.35, 0.78, c1));
+            sky = mix(sky, cloudCol, cMask * 0.88);
+            cloudAlphaBoost = cMask * 0.45;
+        }
+
         float belowMask = smoothstep(-0.28, -0.02, elev);
-        float alpha = clamp(atmoDensity * (0.15 + 0.85 * dayFactor) * (0.45 + 0.55 * horizonFactor) * belowMask, 0.0, 0.96);
+        float alpha = clamp((atmoDensity * (0.15 + 0.85 * dayFactor) * (0.45 + 0.55 * horizonFactor) + cloudAlphaBoost * atmoDensity) * belowMask, 0.0, 0.96);
 
         _output.color = vec4(sky * (0.12 + 0.88 * dayFactor), alpha);
         """
