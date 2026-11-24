@@ -16,22 +16,33 @@ struct SpaceSimApp: App {
 final class SpaceSimulationController: ObservableObject {
     let scene = SCNScene()
     let shipNode = SCNNode()
+    let shipVisualNode = SCNNode()
     let thirdPersonMeshNode = SCNNode()
     let cockpitMeshNode = SCNNode()
     let cameraBoomNode = SCNNode()
     let cameraNode = SCNNode()
     let sunLightNode = SCNNode()
-    var exhaustNodes: [SCNNode] = []
+    let dustRootNode = SCNNode()
 
-    // Реальные 64-битные координаты и вектор скорости (м и м/с)
+    var exhaustNodes: [SCNNode] = []
+    var dustParticles: [(node: SCNNode, offset: SIMD3<Float>)] = []
+
+    // 64-битные координаты и физика 1:1
     var shipPositionMeters = SIMD3<Double>(-UniverseCatalog.au + 10_200_000, 2_800_000, 11_400_000)
     var shipVelocityMetersPerSec = SIMD3<Double>(0, 0, 0)
     var shipOrientation = simd_quatd(angle: 0.68, axis: simd_normalize(SIMD3<Double>(-0.18, 1.0, 0.0)))
 
-    // Углы свободного облёта камеры вокруг корабля (в 3-м лице)
+    // Угловая скорость для плавного управления джойстиком
+    var angularVelYaw: Double = 0
+    var angularVelPitch: Double = 0
+    var stickInput: CGPoint = .zero // x: -1...1 (yaw), y: -1...1 (pitch)
+
+    // Свободный облёт камеры (свайп по экрану) + пружинное отставание
     var orbitYaw: Float = 0.0
-    var orbitPitch: Float = -0.14
-    var orbitDistance: Float = 12.5
+    var orbitPitch: Float = -0.16
+    var orbitDistance: Float = 13.5
+    var cameraLagYaw: Float = 0.0
+    var cameraLagPitch: Float = 0.0
 
     var simulationTimeSeconds: Double = 0.0
 
@@ -39,7 +50,6 @@ final class SpaceSimulationController: ObservableObject {
     @Published var timeWarpIndex: Int = 0
     @Published var throttle: Double = 0.0
     @Published var flightAssist: Bool = true
-    @Published var freeLookMode: Bool = false
     @Published var targetBody: CelestialBody = UniverseCatalog.bodies[3]
     @Published var distanceText: String = "10.2 тыс. км"
     @Published var speedText: String = "0 м/с"
@@ -69,6 +79,8 @@ final class SpaceSimulationController: ObservableObject {
 
     private var bodyNodes: [String: SCNNode] = [:]
     private var planetMeshNodes: [String: SCNNode] = [:]
+    private var planetMaterials: [String: SCNMaterial] = [:]
+    private var atmoMaterials: [String: SCNMaterial] = [:]
     private var lastUpdateTime: TimeInterval = 0
 
     init() {
@@ -76,41 +88,64 @@ final class SpaceSimulationController: ObservableObject {
     }
 
     private func setupScene() {
-        // Полноценная 6-гранная 3D-кубмапа звёздного неба — при повороте корабля звёзды движутся вместе со Вселенной!
         scene.background.contents = generateStarCubemap()
 
         let sunLight = SCNLight()
         sunLight.type = .directional
-        sunLight.intensity = 1550
+        sunLight.intensity = 1700
         sunLight.color = UIColor(red: 1.0, green: 0.98, blue: 0.95, alpha: 1.0)
         sunLightNode.light = sunLight
         scene.rootNode.addChildNode(sunLightNode)
 
         let ambient = SCNLight()
         ambient.type = .ambient
-        ambient.intensity = 28
-        ambient.color = UIColor(red: 0.14, green: 0.20, blue: 0.32, alpha: 1.0)
+        ambient.intensity = 18
+        ambient.color = UIColor(red: 0.12, green: 0.18, blue: 0.30, alpha: 1.0)
         let ambientNode = SCNNode()
         ambientNode.light = ambient
         scene.rootNode.addChildNode(ambientNode)
 
         buildThirdPersonShip()
         buildFirstPersonCockpit()
-        shipNode.addChildNode(thirdPersonMeshNode)
-        shipNode.addChildNode(cockpitMeshNode)
+        shipVisualNode.addChildNode(thirdPersonMeshNode)
+        shipVisualNode.addChildNode(cockpitMeshNode)
+        shipNode.addChildNode(shipVisualNode)
         scene.rootNode.addChildNode(shipNode)
 
-        // Узел-кронштейн для облёта камеры вокруг звездолёта
         shipNode.addChildNode(cameraBoomNode)
         let cam = SCNCamera()
         cam.zNear = 0.08
         cam.zFar = 1_500_000
-        cam.fieldOfView = 60
+        cam.fieldOfView = 62
         cameraNode.camera = cam
         cameraBoomNode.addChildNode(cameraNode)
         updateCameraMode()
 
+        buildSpaceDust()
         buildCelestialBodies()
+    }
+
+    private func buildSpaceDust() {
+        scene.rootNode.addChildNode(dustRootNode)
+        let dot = SCNSphere(radius: 0.055)
+        let mat = SCNMaterial()
+        mat.lightingModel = .constant
+        mat.diffuse.contents = UIColor(white: 0.85, alpha: 0.55)
+        dot.materials = [mat]
+
+        var rng: UInt64 = 0x55AA33CC11229988
+        func rand() -> Float {
+            rng = rng &* 6364136223846793005 &+ 1442695040888963407
+            return Float(rng >> 33) / Float(1 << 31)
+        }
+
+        for _ in 0..<110 {
+            let n = SCNNode(geometry: dot)
+            let p = SIMD3<Float>((rand() - 0.5) * 90, (rand() - 0.5) * 90, (rand() - 0.5) * 90)
+            n.simdPosition = p
+            dustRootNode.addChildNode(n)
+            dustParticles.append((n, p))
+        }
     }
 
     private func buildCelestialBodies() {
@@ -128,30 +163,44 @@ final class SpaceSimulationController: ObservableObject {
                 mat.shaderModifiers = [.surface: starShaderModifier()]
             } else {
                 mat.lightingModel = .physicallyBased
-                mat.roughness.contents = body.id == "earth" ? 0.42 : 0.88
+                mat.roughness.contents = body.id == "earth" ? 0.40 : 0.88
                 mat.metalness.contents = 0.02
                 mat.shaderModifiers = [.surface: planetShaderModifier(for: body)]
+                mat.setValue(NSValue(scnVector3: SCNVector3(1, 0, 0)), forKey: "sunDir")
+                planetMaterials[body.id] = mat
             }
             sphere.materials = [mat]
             let meshNode = SCNNode(geometry: sphere)
             root.addChildNode(meshNode)
             planetMeshNodes[body.id] = meshNode
 
-            // Мягкое рэлеевское рассеяние атмосферы (плавный переход в космос без резкого кольца)[span_19](start_span)[span_19](end_span)[span_20](start_span)[span_20](end_span)
+            // Физически корректная атмосфера: яркая на дневной стороне, закатный оттенок на терминаторе, чёрная ночью
             if body.hasAtmosphere && !body.isStar {
-                let atmoSphere = SCNSphere(radius: 1.045)
+                let atmoSphere = SCNSphere(radius: 1.042)
                 atmoSphere.segmentCount = 96
                 let atmoMat = SCNMaterial()
                 atmoMat.lightingModel = .constant
                 atmoMat.blendMode = .add
                 atmoMat.cullMode = .front
                 atmoMat.writesToDepthBuffer = false
-                let atmoVec = body.id == "mars" ? "vec3(0.92, 0.44, 0.22)" : "vec3(0.24, 0.58, 1.0)"
+                let dayCol = body.id == "mars" ? "vec3(0.95, 0.48, 0.25)" : "vec3(0.24, 0.58, 1.0)"
+                let sunsetCol = body.id == "mars" ? "vec3(0.85, 0.28, 0.12)" : "vec3(1.0, 0.45, 0.16)"
                 atmoMat.shaderModifiers = [.fragment: """
-                    float ndotv = clamp(abs(dot(normalize(_surface.normal), normalize(_surface.view))), 0.0, 1.0);
-                    float halo = pow(ndotv, 2.6) * smoothstep(0.0, 0.45, 1.0 - ndotv);
-                    _output.color = vec4(\(atmoVec) * halo * 1.35, halo);
+                    #pragma arguments
+                    vec3 sunDir;
+                    #pragma body
+                    vec3 n = normalize(_surface.normal);
+                    vec3 v = normalize(_surface.view);
+                    float ndotv = clamp(abs(dot(n, v)), 0.0, 1.0);
+                    float rim = pow(ndotv, 2.8) * smoothstep(0.0, 0.42, 1.0 - ndotv);
+                    float sunDot = dot(n, normalize(sunDir));
+                    float dayMask = smoothstep(-0.22, 0.35, sunDot);
+                    float sunsetMask = exp(-pow((sunDot + 0.02) * 4.5, 2.0));
+                    vec3 col = mix(\(dayCol), \(sunsetCol), sunsetMask * 0.65);
+                    _output.color = vec4(col * rim * dayMask * 1.65, rim * dayMask);
                 """]
+                atmoMat.setValue(NSValue(scnVector3: SCNVector3(1, 0, 0)), forKey: "sunDir")
+                atmoMaterials[body.id] = atmoMat
                 atmoSphere.materials = [atmoMat]
                 root.addChildNode(SCNNode(geometry: atmoSphere))
             }
@@ -175,7 +224,7 @@ final class SpaceSimulationController: ObservableObject {
         }
     }
 
-    // Фотореалистичный шейдер планет: многооктавный рельеф с расчётом нормалей гор, океанские блики, циклоны облаков и ночные огни городов
+    // Реалистичный 3D-шейдер планет с настоящим градиентным FBM-шумом, искривлением облаков и ночными огнями только на тёмной стороне
     private func planetShaderModifier(for body: CelestialBody) -> String {
         let mode: Int
         switch body.id {
@@ -189,22 +238,38 @@ final class SpaceSimulationController: ObservableObject {
         let c2 = rgbComponents(body.secondaryHex)
 
         return """
+        #pragma arguments
+        vec3 sunDir;
+        #pragma body
         vec3 pos = normalize(_surface.position);
-        vec3 p = pos * 3.4;
 
-        // 6-октавный фрактальный 3D-шум (FBM) для детальной береговой линии и гор
+        // Настоящий 3D Value Noise + 6-октавный FBM
+        vec3 p = pos * 3.8;
         float n = 0.0;
         float ridge = 0.0;
-        float amp = 0.52;
+        float amp = 0.5;
         vec3 q = p;
         for (int i = 0; i < 6; i++) {
-            float s = sin(q.x * 2.15 + cos(q.y * 2.35 + sin(q.z * 2.45)));
-            float c = cos(q.z * 2.25 + sin(q.x * 2.40 + cos(q.y * 2.05)));
-            float v = s * c * 0.5 + 0.5;
+            vec3 fl = floor(q);
+            vec3 fr = fract(q);
+            fr = fr * fr * (3.0 - 2.0 * fr);
+            float n000 = fract(sin(dot(fl + vec3(0,0,0), vec3(127.1, 311.7, 74.7))) * 43758.5453);
+            float n100 = fract(sin(dot(fl + vec3(1,0,0), vec3(127.1, 311.7, 74.7))) * 43758.5453);
+            float n010 = fract(sin(dot(fl + vec3(0,1,0), vec3(127.1, 311.7, 74.7))) * 43758.5453);
+            float n110 = fract(sin(dot(fl + vec3(1,1,0), vec3(127.1, 311.7, 74.7))) * 43758.5453);
+            float n001 = fract(sin(dot(fl + vec3(0,0,1), vec3(127.1, 311.7, 74.7))) * 43758.5453);
+            float n101 = fract(sin(dot(fl + vec3(1,0,1), vec3(127.1, 311.7, 74.7))) * 43758.5453);
+            float n011 = fract(sin(dot(fl + vec3(0,1,1), vec3(127.1, 311.7, 74.7))) * 43758.5453);
+            float n111 = fract(sin(dot(fl + vec3(1,1,1), vec3(127.1, 311.7, 74.7))) * 43758.5453);
+            float nx00 = mix(n000, n100, fr.x);
+            float nx10 = mix(n010, n110, fr.x);
+            float nx01 = mix(n001, n101, fr.x);
+            float nx11 = mix(n011, n111, fr.x);
+            float v = mix(mix(nx00, nx10, fr.y), mix(nx01, nx11, fr.y), fr.z);
             n += v * amp;
             ridge += (1.0 - abs(v * 2.0 - 1.0)) * amp;
-            q = q * 2.11 + vec3(1.7, 9.2, 5.4);
-            amp *= 0.49;
+            q = q * 2.08 + vec3(13.4, 7.1, 19.3);
+            amp *= 0.48;
         }
 
         vec3 col1 = vec3(\(c1.r), \(c1.g), \(c1.b));
@@ -212,75 +277,74 @@ final class SpaceSimulationController: ObservableObject {
         vec3 albedo = col1;
         vec3 emissive = vec3(0.0);
         float rough = 0.86;
-        float bumpScale = 0.08;
+        float sunDot = dot(pos, normalize(sunDir));
+        float nightMask = smoothstep(0.08, -0.18, sunDot);
 
         int planetMode = \(mode);
         if (planetMode == 1) {
             float lat = abs(pos.y);
-            if (lat + n * 0.14 > 0.87) {
+            if (lat + n * 0.16 > 0.86) {
                 albedo = vec3(0.95, 0.97, 1.0);
-                rough = 0.58;
-            } else if (n < 0.50) {
-                float depth = clamp(n / 0.50, 0.0, 1.0);
-                albedo = mix(vec3(0.015, 0.08, 0.28), vec3(0.05, 0.32, 0.65), pow(depth, 1.5));
-                rough = 0.14;
-                bumpScale = 0.005;
+                rough = 0.55;
+            } else if (n < 0.495) {
+                float depth = clamp(n / 0.495, 0.0, 1.0);
+                albedo = mix(vec3(0.01, 0.05, 0.22), vec3(0.04, 0.28, 0.58), pow(depth, 1.8));
+                rough = 0.12;
             } else {
-                float h = (n - 0.50) / 0.50;
-                vec3 forest = vec3(0.11, 0.34, 0.14);
-                vec3 steppe = vec3(0.56, 0.50, 0.30);
-                vec3 mountain = vec3(0.38, 0.36, 0.34);
+                float h = (n - 0.495) / 0.505;
+                vec3 forest = vec3(0.09, 0.28, 0.11);
+                vec3 desert = vec3(0.62, 0.53, 0.34);
+                vec3 rock = vec3(0.36, 0.34, 0.32);
                 vec3 snow = vec3(0.94, 0.96, 0.98);
-                albedo = mix(forest, steppe, smoothstep(0.12, 0.42, h));
-                albedo = mix(albedo, mountain, smoothstep(0.45, 0.72, h + ridge * 0.15));
-                albedo = mix(albedo, snow, smoothstep(0.78, 0.95, h + ridge * 0.2));
-                rough = 0.90;
-                bumpScale = 0.18;
+                float aridity = smoothstep(0.05, 0.38, abs(lat - 0.28));
+                vec3 lowLand = mix(desert, forest, aridity);
+                albedo = mix(lowLand, rock, smoothstep(0.35, 0.70, h + ridge * 0.12));
+                albedo = mix(albedo, snow, smoothstep(0.75, 0.92, h + ridge * 0.18));
+                rough = 0.92;
 
-                // Ночные огни мегаполисов вдоль побережья
-                if (h < 0.18 && lat < 0.68) {
-                    float cityNoise = fract(sin(dot(floor(pos * 180.0), vec3(12.9898, 78.233, 37.719))) * 43758.5453);
-                    if (cityNoise > 0.86) {
-                        emissive = vec3(1.0, 0.72, 0.32) * (cityNoise - 0.86) * 4.5;
+                // Ночные огни городов ТОЛЬКО на ночной стороне Земли
+                if (h < 0.22 && lat < 0.65 && nightMask > 0.01) {
+                    float cHash = fract(sin(dot(floor(pos * 220.0), vec3(12.9898, 78.233, 37.719))) * 43758.5453);
+                    if (cHash > 0.88) {
+                        emissive = vec3(1.0, 0.72, 0.30) * (cHash - 0.88) * 9.0 * nightMask;
                     }
                 }
             }
 
-            // Вихревые циклоны облаков
-            vec3 swirl = pos * 4.2 + vec3(sin(pos.y * 6.0) * 0.35 + u_time * 0.008, 0.0, cos(pos.x * 6.0) * 0.35);
+            // Вихревые облака (domain-warped FBM)
+            vec3 cp = pos * 4.8 + vec3(n * 0.85 + u_time * 0.005, n * 0.45, -n * 0.65);
             float cn = 0.0;
-            float camp = 0.54;
-            for (int j = 0; j < 5; j++) {
-                cn += (sin(swirl.x * 2.5 + cos(swirl.y * 2.2 + swirl.z * 2.4)) * 0.5 + 0.5) * camp;
-                swirl = swirl * 2.18 + vec3(3.1, 1.4, 7.2);
+            float camp = 0.52;
+            for (int j = 0; j < 4; j++) {
+                vec3 fl = floor(cp);
+                vec3 fr = fract(cp);
+                fr = fr * fr * (3.0 - 2.0 * fr);
+                float a = fract(sin(dot(fl, vec3(127.1, 311.7, 74.7))) * 43758.5453);
+                float b = fract(sin(dot(fl + vec3(1,1,1), vec3(127.1, 311.7, 74.7))) * 43758.5453);
+                cn += mix(a, b, (fr.x + fr.y + fr.z) * 0.333) * camp;
+                cp = cp * 2.15 + vec3(5.2, 1.3, 8.7);
                 camp *= 0.48;
             }
-            float clouds = smoothstep(0.55, 0.80, cn);
-            albedo = mix(albedo, vec3(0.98, 0.99, 1.0), clouds * 0.90);
+            float clouds = smoothstep(0.50, 0.76, cn);
+            albedo = mix(albedo, vec3(0.98, 0.99, 1.0), clouds * 0.88);
             emissive *= (1.0 - clouds * 0.85);
-            rough = mix(rough, 0.92, clouds);
+            rough = mix(rough, 0.94, clouds);
         } else if (planetMode == 2) {
             float lat = abs(pos.y);
-            albedo = mix(col2, col1, smoothstep(0.28, 0.72, n));
-            albedo = mix(albedo, vec3(0.82, 0.46, 0.28), ridge * 0.22);
-            if (lat + n * 0.1 > 0.88) albedo = vec3(0.95, 0.94, 0.92);
-            bumpScale = 0.22;
-        } else if (planetMode == 3) {
-            float turb = sin(pos.x * 9.0 + n * 5.0) * 0.04;
-            float yBand = (pos.y + turb) * 16.0 + n * 2.4;
-            float stripe = sin(yBand) * 0.5 + 0.5;
-            albedo = mix(col2, col1, smoothstep(0.18, 0.82, stripe));
-            rough = 0.62;
-            bumpScale = 0.02;
-        } else {
             albedo = mix(col2, col1, smoothstep(0.25, 0.75, n));
-            albedo *= (0.75 + ridge * 0.45);
-            bumpScale = 0.26;
+            albedo = mix(albedo, vec3(0.84, 0.48, 0.28), ridge * 0.25);
+            if (lat + n * 0.1 > 0.88) albedo = vec3(0.95, 0.94, 0.92);
+        } else if (planetMode == 3) {
+            float turb = (n - 0.5) * 0.22;
+            float yBand = (pos.y + turb) * 18.0;
+            float stripe = sin(yBand) * 0.5 + 0.5;
+            albedo = mix(col2, col1, smoothstep(0.15, 0.85, stripe));
+            rough = 0.62;
+        } else {
+            albedo = mix(col2, col1, smoothstep(0.22, 0.78, n));
+            albedo *= (0.72 + ridge * 0.48);
         }
 
-        // Возмущение нормали рельефом для объёмных теней гор на терминаторе
-        vec3 dPos = vec3(dFdx(n), dFdy(n), 0.0);
-        _surface.normal = normalize(_surface.normal - dPos * bumpScale * 18.0);
         _surface.diffuse = vec4(albedo, 1.0);
         _surface.emission.rgb += emissive;
         _surface.roughness = rough;
@@ -391,20 +455,6 @@ final class SpaceSimulationController: ObservableObject {
         trimNode.position = SCNVector3(0, -0.40, -0.60)
         cockpitMeshNode.addChildNode(trimNode)
 
-        for (idx, xPos) in [-0.42, 0.0, 0.42].enumerated() {
-            let screen = SCNBox(width: 0.32, height: 0.14, length: 0.01, chamferRadius: 0.01)
-            let sMat = SCNMaterial()
-            sMat.lightingModel = .constant
-            sMat.diffuse.contents = idx == 1
-                ? UIColor(red: 0.06, green: 0.24, blue: 0.36, alpha: 1.0)
-                : UIColor(red: 0.05, green: 0.16, blue: 0.26, alpha: 1.0)
-            screen.materials = [sMat]
-            let scNode = SCNNode(geometry: screen)
-            scNode.position = SCNVector3(Float(xPos), -0.46, -0.66)
-            scNode.eulerAngles.x = -0.35
-            cockpitMeshNode.addChildNode(scNode)
-        }
-
         for side in [-1.0, 1.0] {
             let strut = SCNBox(width: 0.04, height: 1.15, length: 0.04, chamferRadius: 0.01)
             strut.materials = [frameMat]
@@ -439,7 +489,7 @@ final class SpaceSimulationController: ObservableObject {
         thirdPersonMeshNode.isHidden = !isThirdPerson
         cockpitMeshNode.isHidden = isThirdPerson
         if isThirdPerson {
-            cameraBoomNode.eulerAngles = SCNVector3(orbitPitch, orbitYaw, 0)
+            cameraBoomNode.eulerAngles = SCNVector3(orbitPitch + cameraLagPitch, orbitYaw + cameraLagYaw, 0)
             cameraNode.position = SCNVector3(0, 0, orbitDistance)
             cameraNode.eulerAngles = SCNVector3(0, 0, 0)
         } else {
@@ -449,7 +499,6 @@ final class SpaceSimulationController: ObservableObject {
         }
     }
 
-    // 6-гранная 3D-кубмапа звёзд — вращается в 3D при любом повороте корабля
     private func generateStarCubemap() -> [UIImage] {
         let size = 1024
         var faces: [UIImage] = []
@@ -464,7 +513,7 @@ final class SpaceSimulationController: ObservableObject {
             let renderer = UIGraphicsImageRenderer(size: CGSize(width: size, height: size))
             let img = renderer.image { context in
                 let ctx = context.cgContext
-                ctx.setFillColor(UIColor(red: 0.008, green: 0.012, blue: 0.024, alpha: 1.0).cgColor)
+                ctx.setFillColor(UIColor(red: 0.006, green: 0.009, blue: 0.018, alpha: 1.0).cgColor)
                 ctx.fill(CGRect(x: 0, y: 0, width: size, height: size))
 
                 var rng: UInt64 = UInt64(face + 1) &* 0x9E3779B97F4A7C15
@@ -473,7 +522,6 @@ final class SpaceSimulationController: ObservableObject {
                     return Double(rng >> 33) / Double(1 << 31)
                 }
 
-                // Полоса Млечного Пути на боковых гранях кубмапы
                 if face == 0 || face == 1 || face == 4 || face == 5 {
                     for _ in 0..<900 {
                         let x = CGFloat(nextRand() * Double(size))
@@ -517,28 +565,13 @@ final class SpaceSimulationController: ObservableObject {
         }
     }
 
-    func handleDrag(dx: Double, dy: Double) {
-        if freeLookMode && isThirdPerson {
-            // Свободный облёт камеры вокруг корабля[span_21](start_span)[span_21](end_span)
+    /// Свайп по экрану — свободный облёт камеры вокруг корабля (не дёргает руль!)
+    func handleCameraOrbitDrag(dx: Double, dy: Double) {
+        if isThirdPerson {
             orbitYaw -= Float(dx * 0.006)
-            orbitPitch = max(-1.3, min(1.3, orbitPitch - Float(dy * 0.006)))
+            orbitPitch = max(-1.35, min(1.35, orbitPitch - Float(dy * 0.006)))
             updateCameraMode()
-        } else {
-            // Естественный поворот звездолёта вправо/влево и вверх/вниз[span_22](start_span)[span_22](end_span)[span_23](start_span)[span_23](end_span)[span_24](start_span)[span_24](end_span)
-            rotateShip(yawDelta: -dx * 0.0035, pitchDelta: -dy * 0.0035)
         }
-    }
-
-    func rotateShip(yawDelta: Double, pitchDelta: Double) {
-        let qYaw = simd_quatd(angle: yawDelta, axis: SIMD3(0, 1, 0))
-        let qPitch = simd_quatd(angle: pitchDelta, axis: SIMD3(1, 0, 0))
-        shipOrientation = simd_normalize(shipOrientation * qYaw * qPitch)
-        shipNode.simdOrientation = simd_quatf(
-            ix: Float(shipOrientation.imag.x),
-            iy: Float(shipOrientation.imag.y),
-            iz: Float(shipOrientation.imag.z),
-            r: Float(shipOrientation.real)
-        )
     }
 
     func alignToTarget() {
@@ -553,9 +586,10 @@ final class SpaceSimulationController: ObservableObject {
             shipOrientation = simd_quatd(angle: acos(max(-1.0, min(1.0, dot))), axis: axis)
         }
         orbitYaw = 0
-        orbitPitch = -0.14
+        orbitPitch = -0.16
+        angularVelYaw = 0
+        angularVelPitch = 0
         updateCameraMode()
-        rotateShip(yawDelta: 0, pitchDelta: 0)
     }
 
     func warpToBody(_ body: CelestialBody) {
@@ -577,7 +611,39 @@ final class SpaceSimulationController: ObservableObject {
         let simDt = realDt * warp
         simulationTimeSeconds += simDt
 
-        // Физика движения 1:1 с инерцией и Flight Assist
+        // Плавное управление рулём через виртуальный джойстик + инерция и крен корпуса
+        let targetYawRate = -Double(stickInput.x) * 1.45
+        let targetPitchRate = -Double(stickInput.y) * 1.15
+        let damp = min(1.0, realDt * 6.5)
+        angularVelYaw += (targetYawRate - angularVelYaw) * damp
+        angularVelPitch += (targetPitchRate - angularVelPitch) * damp
+
+        if abs(angularVelYaw) > 0.0001 || abs(angularVelPitch) > 0.0001 {
+            let qYaw = simd_quatd(angle: angularVelYaw * realDt, axis: SIMD3(0, 1, 0))
+            let qPitch = simd_quatd(angle: angularVelPitch * realDt, axis: SIMD3(1, 0, 0))
+            shipOrientation = simd_normalize(shipOrientation * qYaw * qPitch)
+        }
+
+        shipNode.simdOrientation = simd_quatf(
+            ix: Float(shipOrientation.imag.x),
+            iy: Float(shipOrientation.imag.y),
+            iz: Float(shipOrientation.imag.z),
+            r: Float(shipOrientation.real)
+        )
+
+        // Визуальный крен корабля и пружинное отставание камеры — создаёт живое ощущение полёта корабля в космосе!
+        let desiredBank = Float(angularVelYaw * 0.35)
+        let desiredPitchVis = Float(angularVelPitch * 0.18)
+        shipVisualNode.eulerAngles.z += (desiredBank - shipVisualNode.eulerAngles.z) * Float(min(1.0, realDt * 8.0))
+        shipVisualNode.eulerAngles.x += (desiredPitchVis - shipVisualNode.eulerAngles.x) * Float(min(1.0, realDt * 8.0))
+
+        cameraLagYaw += (Float(-angularVelYaw * 0.14) - cameraLagYaw) * Float(min(1.0, realDt * 5.0))
+        cameraLagPitch += (Float(-angularVelPitch * 0.10) - cameraLagPitch) * Float(min(1.0, realDt * 5.0))
+        if isThirdPerson {
+            cameraBoomNode.eulerAngles = SCNVector3(orbitPitch + cameraLagPitch, orbitYaw + cameraLagYaw, 0)
+        }
+
+        // Физика движения 1:1
         let targetSpeed = speedSteps[speedIndex].mps * throttle
         let forwardVec = shipOrientation.act(SIMD3<Double>(0, 0, -1))
         let desiredVelocity = forwardVec * targetSpeed
@@ -592,17 +658,32 @@ final class SpaceSimulationController: ObservableObject {
         shipPositionMeters += shipVelocityMetersPerSec * simDt
         let actualSpeed = simd_length(shipVelocityMetersPerSec)
 
+        // Движение 3D-пыли мимо корабля (тактильное ощущение полёта)
+        if actualSpeed > 1.0 {
+            let velDir = simd_normalize(shipVelocityMetersPerSec)
+            let dustSpeed = Float(min(85.0, log10(actualSpeed + 1.0) * 14.0))
+            let move = SIMD3<Float>(Float(-velDir.x), Float(-velDir.y), Float(-velDir.z)) * dustSpeed * Float(realDt)
+            for i in 0..<dustParticles.count {
+                var p = dustParticles[i].offset + move
+                if p.x > 45 { p.x -= 90 } else if p.x < -45 { p.x += 90 }
+                if p.y > 45 { p.y -= 90 } else if p.y < -45 { p.y += 90 }
+                if p.z > 45 { p.z -= 90 } else if p.z < -45 { p.z += 90 }
+                dustParticles[i].offset = p
+                dustParticles[i].node.simdPosition = p
+            }
+        }
+
         let flameScale = Float(max(0.05, throttle * (1.0 + Double(speedIndex) * 0.22)))
         for fNode in exhaustNodes {
             fNode.scale = SCNVector3(1.0, flameScale, 1.0)
             fNode.isHidden = throttle <= 0.01
         }
 
-        let sunDir = simd_normalize(shipPositionMeters)
-        let fDir = SIMD3<Float>(Float(sunDir.x), Float(sunDir.y), Float(sunDir.z))
-        sunLightNode.simdLook(at: fDir, up: SIMD3<Float>(0, 1, 0), localFront: SIMD3<Float>(0, 0, -1))
+        let sunDirWorld = simd_normalize(-shipPositionMeters)
+        let fSunDir = SCNVector3(Float(sunDirWorld.x), Float(sunDirWorld.y), Float(sunDirWorld.z))
+        let lookTarget = SIMD3<Float>(Float(-sunDirWorld.x), Float(-sunDirWorld.y), Float(-sunDirWorld.z))
+        sunLightNode.simdLook(at: lookTarget, up: SIMD3<Float>(0, 1, 0), localFront: SIMD3<Float>(0, 0, -1))
 
-        // Реальное движение планет по орбитам и вращение вокруг своей оси 1:1
         for body in UniverseCatalog.bodies {
             guard let node = bodyNodes[body.id] else { continue }
             let bodyPos = body.currentPosition(simulationTime: simulationTimeSeconds, allBodies: UniverseCatalog.bodies)
@@ -620,6 +701,13 @@ final class SpaceSimulationController: ObservableObject {
             if body.rotationPeriodSeconds != 0, let mesh = planetMeshNodes[body.id] {
                 let spin = (2.0 * .pi / body.rotationPeriodSeconds) * simulationTimeSeconds
                 mesh.eulerAngles.y = Float(spin.truncatingRemainder(dividingBy: 2.0 * .pi))
+            }
+
+            if !body.isStar {
+                let toSun = simd_normalize(-bodyPos)
+                let sunVec = NSValue(scnVector3: SCNVector3(Float(toSun.x), Float(toSun.y), Float(toSun.z)))
+                planetMaterials[body.id]?.setValue(sunVec, forKey: "sunDir")
+                atmoMaterials[body.id]?.setValue(sunVec, forKey: "sunDir")
             }
         }
 
@@ -674,6 +762,44 @@ final class SpaceSimulationController: ObservableObject {
     }
 }
 
+struct VirtualFlightStick: View {
+    var onChange: (CGPoint) -> Void
+    @State private var knobOffset: CGSize = .zero
+    private let maxRadius: CGFloat = 38
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .fill(Color.black.opacity(0.45))
+                .overlay(Circle().stroke(Color.cyan.opacity(0.45), lineWidth: 1.5))
+                .frame(width: 96, height: 96)
+
+            Circle()
+                .fill(Color.cyan.opacity(0.85))
+                .frame(width: 34, height: 34)
+                .offset(knobOffset)
+        }
+        .gesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { value in
+                    let dx = value.translation.width
+                    let dy = value.translation.height
+                    let dist = sqrt(dx * dx + dy * dy)
+                    let clamped = min(dist, maxRadius)
+                    let angle = atan2(dy, dx)
+                    let ox = cos(angle) * clamped
+                    let oy = sin(angle) * clamped
+                    knobOffset = CGSize(width: ox, height: oy)
+                    onChange(CGPoint(x: ox / maxRadius, y: oy / maxRadius))
+                }
+                .onEnded { _ in
+                    knobOffset = .zero
+                    onChange(.zero)
+                }
+        )
+    }
+}
+
 struct SceneViewContainer: UIViewRepresentable {
     @ObservedObject var sim: SpaceSimulationController
 
@@ -707,7 +833,7 @@ struct SceneViewContainer: UIViewRepresentable {
 
         @objc func handlePan(_ gesture: UIPanGestureRecognizer) {
             let t = gesture.translation(in: gesture.view)
-            sim.handleDrag(dx: Double(t.x), dy: Double(t.y))
+            sim.handleCameraOrbitDrag(dx: Double(t.x), dy: Double(t.y))
             gesture.setTranslation(.zero, in: gesture.view)
         }
 
@@ -758,17 +884,6 @@ struct ContentView: View {
                         .background(Color.blue.opacity(0.82))
                         .clipShape(Capsule())
 
-                    if sim.isThirdPerson {
-                        Button(sim.freeLookMode ? "Обзор" : "Руль") {
-                            sim.freeLookMode.toggle()
-                        }
-                        .font(.system(size: 11, weight: .bold))
-                        .padding(.horizontal, 10).padding(.vertical, 7)
-                        .background(sim.freeLookMode ? Color.orange.opacity(0.8) : Color.black.opacity(0.70))
-                        .overlay(Capsule().stroke(Color.white.opacity(0.25), lineWidth: 1))
-                        .clipShape(Capsule())
-                    }
-
                     Button(sim.isThirdPerson ? "1-е лицо" : "3-е лицо") {
                         sim.isThirdPerson.toggle()
                         sim.updateCameraMode()
@@ -785,7 +900,12 @@ struct ContentView: View {
 
                 Spacer()
 
-                HStack(alignment: .bottom, spacing: 10) {
+                HStack(alignment: .bottom, spacing: 12) {
+                    // Виртуальный джойстик пилотирования слева снизу
+                    VirtualFlightStick { pt in
+                        sim.stickInput = pt
+                    }
+
                     VStack(alignment: .leading, spacing: 5) {
                         HStack {
                             Text("ТЯГА: \(Int(sim.throttle * 100))%")
@@ -801,7 +921,7 @@ struct ContentView: View {
                             .cornerRadius(6)
                         }
                         Slider(value: $sim.throttle, in: 0...1)
-                            .frame(width: 175)
+                            .frame(width: 150)
                             .tint(.cyan)
                     }
                     .padding(9)
@@ -809,57 +929,58 @@ struct ContentView: View {
                     .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.white.opacity(0.2), lineWidth: 1))
                     .cornerRadius(14)
 
-                    // Регулятор времени 1:1
-                    HStack(spacing: 6) {
-                        Button("−") { sim.timeWarpIndex = max(0, sim.timeWarpIndex - 1) }
-                            .frame(width: 28, height: 28)
-                            .background(Color.white.opacity(0.14))
-                            .clipShape(Circle())
-                        Text("⏱ \(sim.timeWarpSteps[sim.timeWarpIndex].label)")
-                            .font(.system(size: 11, weight: .bold, design: .monospaced))
-                            .foregroundColor(.yellow)
-                        Button("+") { sim.timeWarpIndex = min(sim.timeWarpSteps.count - 1, sim.timeWarpIndex + 1) }
-                            .frame(width: 28, height: 28)
-                            .background(Color.white.opacity(0.14))
-                            .clipShape(Circle())
-                    }
-                    .foregroundColor(.white)
-                    .padding(7)
-                    .background(Color.black.opacity(0.70))
-                    .overlay(Capsule().stroke(Color.white.opacity(0.2), lineWidth: 1))
-                    .clipShape(Capsule())
-
                     Spacer()
 
-                    HStack(spacing: 7) {
-                        Button("−") { sim.speedIndex = max(0, sim.speedIndex - 1) }
-                            .frame(width: 32, height: 32)
-                            .background(Color.white.opacity(0.14))
-                            .clipShape(Circle())
-
-                        Text(sim.speedSteps[sim.speedIndex].label)
-                            .font(.system(size: 12, weight: .bold, design: .monospaced))
-                            .frame(minWidth: 96)
-
-                        Button("+") { sim.speedIndex = min(sim.speedSteps.count - 1, sim.speedIndex + 1) }
-                            .frame(width: 32, height: 32)
-                            .background(Color.white.opacity(0.14))
-                            .clipShape(Circle())
-
-                        Button("СТОП") {
-                            sim.throttle = 0
-                            sim.shipVelocityMetersPerSec = .zero
+                    VStack(alignment: .trailing, spacing: 6) {
+                        HStack(spacing: 6) {
+                            Button("−") { sim.timeWarpIndex = max(0, sim.timeWarpIndex - 1) }
+                                .frame(width: 26, height: 26)
+                                .background(Color.white.opacity(0.14))
+                                .clipShape(Circle())
+                            Text("⏱ \(sim.timeWarpSteps[sim.timeWarpIndex].label)")
+                                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                .foregroundColor(.yellow)
+                            Button("+") { sim.timeWarpIndex = min(sim.timeWarpSteps.count - 1, sim.timeWarpIndex + 1) }
+                                .frame(width: 26, height: 26)
+                                .background(Color.white.opacity(0.14))
+                                .clipShape(Circle())
                         }
-                        .font(.system(size: 11, weight: .bold))
-                        .padding(.horizontal, 11).padding(.vertical, 8)
-                        .background(Color.red.opacity(0.82))
+                        .foregroundColor(.white)
+                        .padding(6)
+                        .background(Color.black.opacity(0.70))
+                        .overlay(Capsule().stroke(Color.white.opacity(0.2), lineWidth: 1))
+                        .clipShape(Capsule())
+
+                        HStack(spacing: 7) {
+                            Button("−") { sim.speedIndex = max(0, sim.speedIndex - 1) }
+                                .frame(width: 30, height: 30)
+                                .background(Color.white.opacity(0.14))
+                                .clipShape(Circle())
+
+                            Text(sim.speedSteps[sim.speedIndex].label)
+                                .font(.system(size: 12, weight: .bold, design: .monospaced))
+                                .frame(minWidth: 92)
+
+                            Button("+") { sim.speedIndex = min(sim.speedSteps.count - 1, sim.speedIndex + 1) }
+                                .frame(width: 30, height: 30)
+                                .background(Color.white.opacity(0.14))
+                                .clipShape(Circle())
+
+                            Button("СТОП") {
+                                sim.throttle = 0
+                                sim.shipVelocityMetersPerSec = .zero
+                            }
+                            .font(.system(size: 11, weight: .bold))
+                            .padding(.horizontal, 10).padding(.vertical, 7)
+                            .background(Color.red.opacity(0.82))
+                            .clipShape(Capsule())
+                        }
+                        .foregroundColor(.white)
+                        .padding(7)
+                        .background(Color.black.opacity(0.70))
+                        .overlay(Capsule().stroke(Color.white.opacity(0.2), lineWidth: 1))
                         .clipShape(Capsule())
                     }
-                    .foregroundColor(.white)
-                    .padding(7)
-                    .background(Color.black.opacity(0.70))
-                    .overlay(Capsule().stroke(Color.white.opacity(0.2), lineWidth: 1))
-                    .clipShape(Capsule())
                 }
                 .padding(.horizontal, 14)
                 .padding(.bottom, 12)
