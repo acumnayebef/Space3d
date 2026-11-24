@@ -1,0 +1,19 @@
+name: SpaceSim1to1
+options:
+  bundleIdPrefix: com.xantapers
+  deploymentTarget:
+    iOS: "17.0"
+targets:
+  SpaceSim1to1:
+    type: application
+    platform: iOS
+    sources: [Sources]
+    settings:
+      base:
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+        INFOPLIST_KEY_UIStatusBarHidden: YES
+        PRODUCT_BUNDLE_IDENTIFIER: com.xantapers.spacesim
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
