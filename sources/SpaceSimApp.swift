@@ -1238,18 +1238,22 @@ final class SpaceSimulationController: ObservableObject {
         reentryHeat = 0.0
 
         let bodyPos = body.currentPosition(simulationTime: simulationTimeSeconds, allBodies: UniverseCatalog.bodies)
-        let offsetDir: SIMD3<Double>
-        if simd_length(bodyPos) < 1_000 {
-            offsetDir = safeNormalize(SIMD3<Double>(0.6, 0.25, 0.75))
-        } else {
-            let toSun = safeNormalize(-bodyPos)
-            let right = safeNormalize(simd_cross(SIMD3<Double>(0, 1, 0), toSun), fallback: SIMD3<Double>(1, 0, 0))
-            offsetDir = safeNormalize(toSun * 0.85 + right * 0.35 + SIMD3<Double>(0, 0.25, 0))
-        }
+        let (_, _, invRot) = planetSpinAndInvRot(for: body)
+        let offsetDir = SurfaceTerrainEngine.findScenicApproachDirection(for: body, bodyPos: bodyPos, invPlanetRot: invRot)
+        let sample = SurfaceTerrainEngine.sampleTerrain(localDir: invRot.act(offsetDir), body: body)
+        let groundH = (body.id == "earth") ? max(0.0, sample.heightMeters) : sample.heightMeters
 
-        shipPositionMeters = bodyPos + offsetDir * (body.radiusMeters + 18_000.0)
-        let horizFwd = safeNormalize(simd_cross(offsetDir, SIMD3<Double>(0, 1, 0)), fallback: SIMD3<Double>(1, 0, 0))
-        let lookFwd = safeNormalize(horizFwd * cos(0.31) - offsetDir * sin(0.31))
+        shipPositionMeters = bodyPos + offsetDir * (body.radiusMeters + groundH + 4_500.0)
+        let toSun = simd_length_squared(bodyPos) > 1e6
+            ? safeNormalize(-bodyPos)
+            : safeNormalize(SIMD3<Double>(0.6, 0.25, 0.75))
+        let sunHoriz = safeNormalize(
+            toSun - offsetDir * simd_dot(toSun, offsetDir),
+            fallback: safeNormalize(simd_cross(offsetDir, SIMD3<Double>(0, 1, 0)), fallback: SIMD3<Double>(1, 0, 0))
+        )
+        let crossSide = safeNormalize(simd_cross(offsetDir, sunHoriz), fallback: SIMD3<Double>(1, 0, 0))
+        let horizFwd = safeNormalize(sunHoriz * 0.55 + crossSide * 0.83)
+        let lookFwd = safeNormalize(horizFwd * cos(0.28) - offsetDir * sin(0.28))
         shipOrientation = orientationFromForwardUp(forward: lookFwd, up: offsetDir)
         orbitYaw = 0
         orbitPitch = -0.16
@@ -1595,6 +1599,7 @@ final class SpaceSimulationController: ObservableObject {
                     anchorWorld: shipPositionMeters,
                     invPlanetRot: invNearestRot,
                     altitudeMeters: max(50.0, updatedSurfaceDist),
+                    whitePixel: whitePixel,
                     compress: { [self] rel in self.compressToScene(rel) }
                 )
                 terrainMeshNode.geometry = res.terrain
@@ -1637,7 +1642,7 @@ final class SpaceSimulationController: ObservableObject {
 
             let fogBrightness = CGFloat(0.12 + 0.88 * dayFactor)
             let twilightMix = Float(exp(-pow((sunElev + 0.02) * 5.0, 2.0))) * 0.45
-            let fogVec = pal.fog + (pal.sunset - pal.fog) * twilightMix
+            let fogVec = (pal.fog + (pal.sunset - pal.fog) * twilightMix) * 0.82
             scene.fogColor = UIColor(
                 red: CGFloat(fogVec.x) * fogBrightness,
                 green: CGFloat(fogVec.y) * fogBrightness,
@@ -1645,10 +1650,10 @@ final class SpaceSimulationController: ObservableObject {
                 alpha: 1.0
             )
             let fogDensity = max(0.02, atmoDensity)
-            scene.fogStartDistance = CGFloat(max(2_500.0, 14_000.0 / fogDensity))
-            scene.fogEndDistance = CGFloat(max(24_000.0, 160_000.0 / fogDensity))
+            scene.fogStartDistance = CGFloat(max(12_000.0, 26_000.0 / fogDensity))
+            scene.fogEndDistance = CGFloat(max(85_000.0, 260_000.0 / fogDensity))
 
-            ambientLightNode.light?.intensity = 22.0 + CGFloat(atmoDensity * dayFactor * 210.0)
+            ambientLightNode.light?.intensity = 22.0 + CGFloat(atmoDensity * dayFactor * 65.0)
         } else {
             skyDomeNode.isHidden = true
             scene.fogEndDistance = 0
@@ -2137,6 +2142,8 @@ struct ContentView: View {
                             Text(sim.simDateText)
                                 .font(.system(size: 10, weight: .semibold, design: .monospaced))
                                 .foregroundColor(.white.opacity(0.85))
+                                .lineLimit(1)
+                                .fixedSize(horizontal: true, vertical: false)
                                 .padding(.horizontal, 4)
 
                             Button(action: { sim.isTimeReversed.toggle() }) {
