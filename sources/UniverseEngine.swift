@@ -81,6 +81,64 @@ struct CelestialBody: Identifiable {
     var meanTempC: Int {
         meanTempK - 273
     }
+
+    var isGasGiant: Bool {
+        id == "jupiter" || id == "saturn" || id == "uranus" || id == "neptune"
+    }
+
+    var isLandable: Bool {
+        !isStar && !isGasGiant
+    }
+
+    var atmosphereHeightMeters: Double {
+        switch id {
+        case "earth": return 120_000
+        case "mars": return 80_000
+        case "venus": return 160_000
+        case "jupiter", "saturn", "uranus", "neptune": return 240_000
+        default: return 0
+        }
+    }
+
+    var atmospherePalette: (zenith: SIMD3<Float>, horizon: SIMD3<Float>, sunset: SIMD3<Float>, fog: SIMD3<Float>) {
+        switch id {
+        case "earth":
+            return (
+                SIMD3<Float>(0.08, 0.28, 0.78),
+                SIMD3<Float>(0.48, 0.76, 1.00),
+                SIMD3<Float>(1.00, 0.42, 0.14),
+                SIMD3<Float>(0.55, 0.74, 0.96)
+            )
+        case "mars":
+            return (
+                SIMD3<Float>(0.58, 0.28, 0.16),
+                SIMD3<Float>(0.88, 0.56, 0.36),
+                SIMD3<Float>(0.82, 0.30, 0.14),
+                SIMD3<Float>(0.82, 0.50, 0.34)
+            )
+        case "venus":
+            return (
+                SIMD3<Float>(0.76, 0.54, 0.22),
+                SIMD3<Float>(0.95, 0.78, 0.44),
+                SIMD3<Float>(0.92, 0.48, 0.16),
+                SIMD3<Float>(0.88, 0.70, 0.38)
+            )
+        case "neptune", "uranus":
+            return (
+                SIMD3<Float>(0.12, 0.38, 0.78),
+                SIMD3<Float>(0.36, 0.76, 0.96),
+                SIMD3<Float>(0.22, 0.48, 0.88),
+                SIMD3<Float>(0.34, 0.70, 0.92)
+            )
+        default:
+            return (
+                SIMD3<Float>(0.62, 0.48, 0.34),
+                SIMD3<Float>(0.86, 0.72, 0.54),
+                SIMD3<Float>(0.88, 0.48, 0.22),
+                SIMD3<Float>(0.78, 0.64, 0.48)
+            )
+        }
+    }
 }
 
 final class UniverseCatalog {

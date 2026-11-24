@@ -36,6 +36,11 @@ final class SpaceSimulationController: ObservableObject {
     let sunLightNode = SCNNode()
     let dustRootNode = SCNNode()
     let orbitLinesNode = SCNNode()
+    let terrainRootNode = SCNNode()
+    let terrainMeshNode = SCNNode()
+    let oceanMeshNode = SCNNode()
+    let skyDomeNode = SCNNode()
+    let ambientLightNode = SCNNode()
 
     var exhaustNodes: [SCNNode] = []
     var dustParticles: [(node: SCNNode, offset: SIMD3<Float>)] = []
@@ -67,7 +72,9 @@ final class SpaceSimulationController: ObservableObject {
     @Published var autoSpeed: Bool = false
     @Published var throttle: Double = 0.0
     @Published var flightAssist: Bool = true
-    @Published var targetBody: CelestialBody = UniverseCatalog.bodies[3]
+    @Published var targetBody: CelestialBody = UniverseCatalog.bodies[3] {
+        didSet { canLandOnTarget = targetBody.isLandable }
+    }
     @Published var distanceText: String = "10.2 тыс. км"
     @Published var speedText: String = "0 м/с"
     @Published var autoSpeedLabel: String = "АВТО"
@@ -75,6 +82,12 @@ final class SpaceSimulationController: ObservableObject {
     @Published var simDateText: String = ""
     @Published var screenMarkers: [BodyScreenMarker] = []
     @Published var isThirdPerson: Bool = true
+    @Published var isLanded: Bool = false
+    @Published var isNearSurface: Bool = false
+    @Published var surfaceAltitudeText: String = ""
+    @Published var atmosphereZoneText: String = ""
+    @Published var reentryHeat: Double = 0.0
+    @Published var canLandOnTarget: Bool = true
 
     let speedSteps: [(label: String, mps: Double)] = [
         ("1.5 км/с", 1_500),
@@ -102,8 +115,19 @@ final class SpaceSimulationController: ObservableObject {
     private var planetMeshNodes: [String: SCNNode] = [:]
     private var planetMaterials: [String: SCNMaterial] = [:]
     private var atmoMaterials: [String: SCNMaterial] = [:]
+    private var atmoNodes: [String: SCNNode] = [:]
+    private var skyDomeMaterial: SCNMaterial?
     private var lastUpdateTime: TimeInterval = 0
     private var frameCounter: Int = 0
+
+    private var activeSurfaceBodyId: String?
+    private var lastTerrainAnchorWorld: SIMD3<Double> = .zero
+    private var lastTerrainAltitude: Double = -1
+    private var lastTrackedBodyId: String?
+    private var lastTrackedBodyPos: SIMD3<Double> = .zero
+    private var lastTrackedSpinAngle: Double = 0
+    private var currentGroundHeightMeters: Double = 0
+    private var landedState: Bool = false
 
     private static let dateFormatter: DateFormatter = {
         let df = DateFormatter()
@@ -147,9 +171,35 @@ final class SpaceSimulationController: ObservableObject {
         ambient.type = .ambient
         ambient.intensity = 22
         ambient.color = UIColor(red: 0.12, green: 0.18, blue: 0.30, alpha: 1.0)
-        let ambientNode = SCNNode()
-        ambientNode.light = ambient
-        scene.rootNode.addChildNode(ambientNode)
+        ambientLightNode.light = ambient
+        scene.rootNode.addChildNode(ambientLightNode)
+
+        terrainRootNode.addChildNode(terrainMeshNode)
+        terrainRootNode.addChildNode(oceanMeshNode)
+        terrainRootNode.isHidden = true
+        scene.rootNode.addChildNode(terrainRootNode)
+
+        let skySphere = SCNSphere(radius: 800.0)
+        skySphere.segmentCount = 48
+        let skyMat = SCNMaterial()
+        skyMat.lightingModel = .constant
+        skyMat.cullMode = .front
+        skyMat.writesToDepthBuffer = false
+        skyMat.readsFromDepthBuffer = false
+        skyMat.blendMode = .alpha
+        skyMat.shaderModifiers = [.fragment: SurfaceTerrainEngine.skyDomeShaderModifier()]
+        skyMat.setValue(NSValue(scnVector3: SCNVector3(0, 1, 0)), forKey: "sunDirView")
+        skyMat.setValue(NSValue(scnVector3: SCNVector3(0, 1, 0)), forKey: "upDirView")
+        skyMat.setValue(NSValue(scnVector3: SCNVector3(0.08, 0.28, 0.78)), forKey: "zenithCol")
+        skyMat.setValue(NSValue(scnVector3: SCNVector3(0.48, 0.76, 1.00)), forKey: "horizonCol")
+        skyMat.setValue(NSValue(scnVector3: SCNVector3(1.00, 0.42, 0.14)), forKey: "sunsetCol")
+        skyMat.setValue(NSNumber(value: Float(0.0)), forKey: "atmoDensity")
+        skySphere.materials = [skyMat]
+        skyDomeMaterial = skyMat
+        skyDomeNode.geometry = skySphere
+        skyDomeNode.renderingOrder = -50
+        skyDomeNode.isHidden = true
+        scene.rootNode.addChildNode(skyDomeNode)
 
         buildThirdPersonShip()
         buildFirstPersonCockpit()
@@ -289,7 +339,9 @@ final class SpaceSimulationController: ObservableObject {
                 atmoMat.setValue(NSValue(scnVector3: SCNVector3(1, 0, 0)), forKey: "sunDirView")
                 atmoMaterials[body.id] = atmoMat
                 atmoSphere.materials = [atmoMat]
-                root.addChildNode(SCNNode(geometry: atmoSphere))
+                let atmoNode = SCNNode(geometry: atmoSphere)
+                root.addChildNode(atmoNode)
+                atmoNodes[body.id] = atmoNode
             }
 
             if body.hasRings {
@@ -1093,15 +1145,45 @@ final class SpaceSimulationController: ObservableObject {
         }
     }
 
+    private func safeNormalize(_ v: SIMD3<Double>, fallback: SIMD3<Double> = SIMD3<Double>(0, 0, -1)) -> SIMD3<Double> {
+        let len2 = simd_length_squared(v)
+        return len2 > 1e-12 ? (v / sqrt(len2)) : fallback
+    }
+
+    private func orientationFromForwardUp(forward: SIMD3<Double>, up: SIMD3<Double>) -> simd_quatd {
+        let f = safeNormalize(forward, fallback: SIMD3<Double>(0, 0, -1))
+        var u = safeNormalize(up, fallback: SIMD3<Double>(0, 1, 0))
+        var r = simd_cross(f, u)
+        if simd_length_squared(r) < 1e-10 {
+            let ref = abs(u.y) < 0.9 ? SIMD3<Double>(0, 1, 0) : SIMD3<Double>(1, 0, 0)
+            r = safeNormalize(simd_cross(ref, u), fallback: SIMD3<Double>(1, 0, 0))
+        } else {
+            r = simd_normalize(r)
+        }
+        u = safeNormalize(simd_cross(r, f), fallback: u)
+        let rotMat = simd_double3x3(columns: (r, u, -f))
+        return simd_normalize(simd_quatd(rotMat))
+    }
+
+    private func planetSpinAndInvRot(for body: CelestialBody) -> (rawSpin: Double, spinFloat: Float, invRot: simd_quatd) {
+        let rawSpin = (body.rotationPeriodSeconds != 0)
+            ? ((2.0 * .pi / body.rotationPeriodSeconds) * simulationTimeSeconds)
+            : 0.0
+        let wrapped = rawSpin.truncatingRemainder(dividingBy: 2.0 * .pi)
+        let invTilt = simd_quatd(angle: -body.axialTiltRad, axis: SIMD3<Double>(0, 0, 1))
+        let invSpin = simd_quatd(angle: -wrapped, axis: SIMD3<Double>(0, 1, 0))
+        return (rawSpin, Float(wrapped), invSpin * invTilt)
+    }
+
     func alignToTarget() {
         let targetPos = targetBody.currentPosition(simulationTime: simulationTimeSeconds, allBodies: UniverseCatalog.bodies)
-        let dir = simd_normalize(targetPos - shipPositionMeters)
+        let dir = safeNormalize(targetPos - shipPositionMeters)
         let forward = SIMD3<Double>(0, 0, -1)
         let dot = simd_dot(forward, dir)
         if dot < -0.9999 {
             shipOrientation = simd_quatd(angle: .pi, axis: SIMD3(0, 1, 0))
-        } else {
-            let axis = simd_normalize(simd_cross(forward, dir))
+        } else if dot < 0.9999 {
+            let axis = safeNormalize(simd_cross(forward, dir), fallback: SIMD3(0, 1, 0))
             shipOrientation = simd_quatd(angle: acos(max(-1.0, min(1.0, dot))), axis: axis)
         }
         orbitYaw = 0
@@ -1115,20 +1197,119 @@ final class SpaceSimulationController: ObservableObject {
         targetBody = body
         throttle = 0
         shipVelocityMetersPerSec = .zero
+        landedState = false
+        isLanded = false
+        lastTerrainAltitude = -1
+        activeSurfaceBodyId = nil
+        lastTrackedBodyId = nil
+        terrainRootNode.isHidden = true
+        skyDomeNode.isHidden = true
+        reentryHeat = 0.0
+
         let bodyPos = body.currentPosition(simulationTime: simulationTimeSeconds, allBodies: UniverseCatalog.bodies)
         let orbitDist = body.radiusMeters * (body.id == "sgr_a" ? 5.8 : 2.9)
 
         let offsetDir: SIMD3<Double>
         if body.isStar || simd_length(bodyPos) < 1_000 {
-            offsetDir = simd_normalize(SIMD3<Double>(0.6, 0.25, 0.75))
+            offsetDir = safeNormalize(SIMD3<Double>(0.6, 0.25, 0.75))
         } else {
-            let toSun = simd_normalize(-bodyPos)
-            let right = simd_normalize(simd_cross(SIMD3<Double>(0, 1, 0), toSun))
-            offsetDir = simd_normalize(toSun * 0.74 + right * 0.62 + SIMD3<Double>(0, 0.20, 0))
+            let toSun = safeNormalize(-bodyPos)
+            let right = safeNormalize(simd_cross(SIMD3<Double>(0, 1, 0), toSun), fallback: SIMD3<Double>(1, 0, 0))
+            offsetDir = safeNormalize(toSun * 0.74 + right * 0.62 + SIMD3<Double>(0, 0.20, 0))
         }
 
         shipPositionMeters = bodyPos + offsetDir * orbitDist
         alignToTarget()
+    }
+
+    func warpToSurfaceApproach(_ body: CelestialBody) {
+        guard body.isLandable else { return }
+        targetBody = body
+        throttle = 0
+        shipVelocityMetersPerSec = .zero
+        landedState = false
+        isLanded = false
+        autoSpeed = true
+        angularVelYaw = 0
+        angularVelPitch = 0
+        lastTerrainAltitude = -1
+        activeSurfaceBodyId = nil
+        lastTrackedBodyId = nil
+        reentryHeat = 0.0
+
+        let bodyPos = body.currentPosition(simulationTime: simulationTimeSeconds, allBodies: UniverseCatalog.bodies)
+        let offsetDir: SIMD3<Double>
+        if simd_length(bodyPos) < 1_000 {
+            offsetDir = safeNormalize(SIMD3<Double>(0.6, 0.25, 0.75))
+        } else {
+            let toSun = safeNormalize(-bodyPos)
+            let right = safeNormalize(simd_cross(SIMD3<Double>(0, 1, 0), toSun), fallback: SIMD3<Double>(1, 0, 0))
+            offsetDir = safeNormalize(toSun * 0.85 + right * 0.35 + SIMD3<Double>(0, 0.25, 0))
+        }
+
+        shipPositionMeters = bodyPos + offsetDir * (body.radiusMeters + 18_000.0)
+        let horizFwd = safeNormalize(simd_cross(offsetDir, SIMD3<Double>(0, 1, 0)), fallback: SIMD3<Double>(1, 0, 0))
+        let lookFwd = safeNormalize(horizFwd * cos(0.31) - offsetDir * sin(0.31))
+        shipOrientation = orientationFromForwardUp(forward: lookFwd, up: offsetDir)
+        orbitYaw = 0
+        orbitPitch = -0.16
+        updateCameraMode()
+    }
+
+    func takeoffFromSurface() {
+        var nearestBody = targetBody
+        var nearestDist = Double.greatestFiniteMagnitude
+        var nearestPos = SIMD3<Double>.zero
+        for body in UniverseCatalog.bodies where body.isLandable {
+            let pos = body.currentPosition(simulationTime: simulationTimeSeconds, allBodies: UniverseCatalog.bodies)
+            let d = simd_length(shipPositionMeters - pos) - body.radiusMeters
+            if d < nearestDist {
+                nearestDist = d
+                nearestBody = body
+                nearestPos = pos
+            }
+        }
+        let upWorld = safeNormalize(shipPositionMeters - nearestPos, fallback: SIMD3<Double>(0, 1, 0))
+        landedState = false
+        isLanded = false
+        throttle = 0.45
+        autoSpeed = true
+        shipVelocityMetersPerSec = upWorld * 65.0
+        shipPositionMeters += upWorld * 5.0
+
+        let fwd = shipOrientation.act(SIMD3<Double>(0, 0, -1))
+        let horiz = safeNormalize(
+            fwd - upWorld * simd_dot(fwd, upWorld),
+            fallback: safeNormalize(simd_cross(upWorld, SIMD3<Double>(1, 0, 0)))
+        )
+        let climbFwd = safeNormalize(horiz * cos(0.26) + upWorld * sin(0.26))
+        shipOrientation = orientationFromForwardUp(forward: climbFwd, up: upWorld)
+        targetBody = nearestBody
+    }
+
+    func levelToHorizon() {
+        var nearestPos = SIMD3<Double>.zero
+        var nearestDist = Double.greatestFiniteMagnitude
+        for body in UniverseCatalog.bodies where !body.isStar {
+            let pos = body.currentPosition(simulationTime: simulationTimeSeconds, allBodies: UniverseCatalog.bodies)
+            let d = simd_length(shipPositionMeters - pos) - body.radiusMeters
+            if d < nearestDist {
+                nearestDist = d
+                nearestPos = pos
+            }
+        }
+        let upWorld = safeNormalize(shipPositionMeters - nearestPos, fallback: SIMD3<Double>(0, 1, 0))
+        let fwd = shipOrientation.act(SIMD3<Double>(0, 0, -1))
+        let horiz = safeNormalize(
+            fwd - upWorld * simd_dot(fwd, upWorld),
+            fallback: safeNormalize(simd_cross(upWorld, SIMD3<Double>(1, 0, 0)))
+        )
+        shipOrientation = orientationFromForwardUp(forward: horiz, up: upWorld)
+        angularVelYaw = 0
+        angularVelPitch = 0
+        orbitYaw = 0
+        orbitPitch = -0.16
+        updateCameraMode()
     }
 
     func stepSimulation(currentTime: TimeInterval, renderer: SCNSceneRenderer) {
@@ -1142,65 +1323,210 @@ final class SpaceSimulationController: ObservableObject {
         let simDt = realDt * warp
         simulationTimeSeconds += simDt
 
-        // Расчёт ближайшей поверхности для логарифмической авто-скорости SpaceEngine
+        var cachedPositions: [String: SIMD3<Double>] = [:]
+        cachedPositions.reserveCapacity(UniverseCatalog.bodies.count)
+
+        var nearestBody: CelestialBody = UniverseCatalog.bodies[3]
+        var nearestBodyPos = SIMD3<Double>.zero
+        var nearestDistFromCenter = Double.greatestFiniteMagnitude
         var nearestSurfaceDist = Double.greatestFiniteMagnitude
+
         for body in UniverseCatalog.bodies {
             let bodyPos = body.currentPosition(simulationTime: simulationTimeSeconds, allBodies: UniverseCatalog.bodies)
-            let d = max(10.0, simd_length(bodyPos - shipPositionMeters) - body.radiusMeters)
-            if d < nearestSurfaceDist { nearestSurfaceDist = d }
+            cachedPositions[body.id] = bodyPos
+            let distCenter = simd_length(bodyPos - shipPositionMeters)
+            let surfDist = max(0.0, distCenter - body.radiusMeters)
+            if surfDist < nearestSurfaceDist {
+                nearestSurfaceDist = surfDist
+                nearestDistFromCenter = distCenter
+                nearestBody = body
+                nearestBodyPos = bodyPos
+            }
         }
-        let autoMaxSpeedMps = max(50.0, nearestSurfaceDist * 0.45)
+
+        let (rawSpinNearest, _, invNearestRot) = planetSpinAndInvRot(for: nearestBody)
+        if !nearestBody.isStar && nearestSurfaceDist < 120_000 {
+            if lastTrackedBodyId == nearestBody.id {
+                let orbitalDelta = nearestBodyPos - lastTrackedBodyPos
+                let lockWeight = landedState ? 1.0 : max(0.0, min(1.0, (120_000.0 - nearestSurfaceDist) / 100_000.0))
+                shipPositionMeters += orbitalDelta * lockWeight
+
+                let dSpin = (rawSpinNearest - lastTrackedSpinAngle) * lockWeight
+                if abs(dSpin) > 1e-12 {
+                    let tiltQuat = simd_quatd(angle: nearestBody.axialTiltRad, axis: SIMD3<Double>(0, 0, 1))
+                    let spinAxis = tiltQuat.act(SIMD3<Double>(0, 1, 0))
+                    let spinDeltaQuat = simd_quatd(angle: dSpin, axis: spinAxis)
+                    let rel = shipPositionMeters - nearestBodyPos
+                    shipPositionMeters = nearestBodyPos + spinDeltaQuat.act(rel)
+                    shipOrientation = simd_normalize(spinDeltaQuat * shipOrientation)
+                }
+            }
+            lastTrackedBodyId = nearestBody.id
+            lastTrackedBodyPos = nearestBodyPos
+            lastTrackedSpinAngle = rawSpinNearest
+        } else {
+            lastTrackedBodyId = nil
+        }
+
+        var upWorld = safeNormalize(shipPositionMeters - nearestBodyPos, fallback: SIMD3<Double>(0, 1, 0))
+        if nearestBody.isLandable && nearestSurfaceDist < 350_000 {
+            let localDir = invNearestRot.act(upWorld)
+            let sample = SurfaceTerrainEngine.sampleTerrain(localDir: localDir, body: nearestBody)
+            currentGroundHeightMeters = (nearestBody.id == "earth") ? max(0.0, sample.heightMeters) : sample.heightMeters
+        } else {
+            currentGroundHeightMeters = 0.0
+        }
+
+        let preRadarAlt = max(0.0, nearestSurfaceDist - currentGroundHeightMeters)
+        let autoMaxSpeedMps: Double
+        if nearestBody.isLandable && preRadarAlt < 2_000 {
+            autoMaxSpeedMps = max(8.0, preRadarAlt * 0.40)
+        } else {
+            autoMaxSpeedMps = max(50.0, max(10.0, nearestSurfaceDist) * 0.45)
+        }
         let effectiveMaxSpeed = autoSpeed ? autoMaxSpeedMps : speedSteps[speedIndex].mps
 
-        let forwardVec = shipOrientation.act(SIMD3<Double>(0, 0, -1))
-        let rightVec = shipOrientation.act(SIMD3<Double>(1, 0, 0))
+        if landedState {
+            let wantsTakeoff = throttle > 0.15 || (isFreeCamera && (abs(stickInput.x) > 0.1 || abs(stickInput.y) > 0.1))
+            if wantsTakeoff {
+                landedState = false
+                shipVelocityMetersPerSec = upWorld * (isFreeCamera ? 25.0 : 55.0)
+                shipPositionMeters += upWorld * 4.0
+            } else {
+                shipVelocityMetersPerSec = .zero
+                angularVelYaw = 0
+                angularVelPitch = 0
+                if !isFreeCamera {
+                    let targetYawRate = -Double(stickInput.x) * 0.9
+                    if abs(targetYawRate) > 0.01 {
+                        let qYaw = simd_quatd(angle: targetYawRate * realDt, axis: upWorld)
+                        shipOrientation = simd_normalize(qYaw * shipOrientation)
+                    }
+                    let curFwd = shipOrientation.act(SIMD3<Double>(0, 0, -1))
+                    let horizFwd = safeNormalize(
+                        curFwd - upWorld * simd_dot(curFwd, upWorld),
+                        fallback: safeNormalize(simd_cross(upWorld, SIMD3<Double>(1, 0, 0)))
+                    )
+                    let flatOrient = orientationFromForwardUp(forward: horizFwd, up: upWorld)
+                    shipOrientation = simd_slerp(shipOrientation, flatOrient, min(1.0, realDt * 6.0))
 
-        if isFreeCamera {
-            // В свободной камере левый джойстик — это полёт вперёд/назад и стрейф (WASD)
-            let moveForward = -Double(stickInput.y) + throttle
-            let moveStrafe = Double(stickInput.x)
-            let desiredVelocity = (forwardVec * moveForward + rightVec * moveStrafe) * effectiveMaxSpeed
-            let response = min(1.0, realDt * 6.0)
-            shipVelocityMetersPerSec += (desiredVelocity - shipVelocityMetersPerSec) * response
+                    let targetStickX = Float(stickInput.y * 0.32)
+                    let targetStickZ = Float(-stickInput.x * 0.32)
+                    cockpitStickPivot.eulerAngles.x += (targetStickX - cockpitStickPivot.eulerAngles.x) * Float(min(1.0, realDt * 12.0))
+                    cockpitStickPivot.eulerAngles.z += (targetStickZ - cockpitStickPivot.eulerAngles.z) * Float(min(1.0, realDt * 12.0))
+                    let targetThrottleAngle = Float(0.35 - throttle * 0.78)
+                    cockpitThrottlePivot.eulerAngles.x += (targetThrottleAngle - cockpitThrottlePivot.eulerAngles.x) * Float(min(1.0, realDt * 10.0))
 
-            shipVisualNode.eulerAngles = SCNVector3(0, 0, 0)
-        } else {
-            let targetYawRate = -Double(stickInput.x) * 1.45
-            let targetPitchRate = -Double(stickInput.y) * 1.15
-            let damp = min(1.0, realDt * 6.5)
-            angularVelYaw += (targetYawRate - angularVelYaw) * damp
-            angularVelPitch += (targetPitchRate - angularVelPitch) * damp
-
-            if abs(angularVelYaw) > 0.0001 || abs(angularVelPitch) > 0.0001 {
-                let qYaw = simd_quatd(angle: angularVelYaw * realDt, axis: SIMD3(0, 1, 0))
-                let qPitch = simd_quatd(angle: angularVelPitch * realDt, axis: SIMD3(1, 0, 0))
-                shipOrientation = simd_normalize(shipOrientation * qYaw * qPitch)
+                    cameraLagYaw += (0 - cameraLagYaw) * Float(min(1.0, realDt * 5.0))
+                    cameraLagPitch += (0 - cameraLagPitch) * Float(min(1.0, realDt * 5.0))
+                    if isThirdPerson {
+                        cameraBoomNode.eulerAngles = SCNVector3(orbitPitch + cameraLagPitch, orbitYaw + cameraLagYaw, 0)
+                    }
+                }
+                shipVisualNode.eulerAngles = SCNVector3(0, 0, 0)
             }
+        }
 
-            let desiredBank = Float(angularVelYaw * 0.35)
-            let desiredPitchVis = Float(angularVelPitch * 0.18)
-            shipVisualNode.eulerAngles.z += (desiredBank - shipVisualNode.eulerAngles.z) * Float(min(1.0, realDt * 8.0))
-            shipVisualNode.eulerAngles.x += (desiredPitchVis - shipVisualNode.eulerAngles.x) * Float(min(1.0, realDt * 8.0))
+        if !landedState {
+            let forwardVec = shipOrientation.act(SIMD3<Double>(0, 0, -1))
+            let rightVec = shipOrientation.act(SIMD3<Double>(1, 0, 0))
 
-            let targetStickX = Float(stickInput.y * 0.32)
-            let targetStickZ = Float(-stickInput.x * 0.32)
-            cockpitStickPivot.eulerAngles.x += (targetStickX - cockpitStickPivot.eulerAngles.x) * Float(min(1.0, realDt * 12.0))
-            cockpitStickPivot.eulerAngles.z += (targetStickZ - cockpitStickPivot.eulerAngles.z) * Float(min(1.0, realDt * 12.0))
-            let targetThrottleAngle = Float(0.35 - throttle * 0.78)
-            cockpitThrottlePivot.eulerAngles.x += (targetThrottleAngle - cockpitThrottlePivot.eulerAngles.x) * Float(min(1.0, realDt * 10.0))
-
-            cameraLagYaw += (Float(-angularVelYaw * 0.14) - cameraLagYaw) * Float(min(1.0, realDt * 5.0))
-            cameraLagPitch += (Float(-angularVelPitch * 0.10) - cameraLagPitch) * Float(min(1.0, realDt * 5.0))
-            if isThirdPerson {
-                cameraBoomNode.eulerAngles = SCNVector3(orbitPitch + cameraLagPitch, orbitYaw + cameraLagYaw, 0)
-            }
-
-            let desiredVelocity = forwardVec * (effectiveMaxSpeed * throttle)
-            if flightAssist {
-                let response = min(1.0, realDt * 3.5)
+            if isFreeCamera {
+                let moveForward = -Double(stickInput.y) + throttle
+                let moveStrafe = Double(stickInput.x)
+                let desiredVelocity = (forwardVec * moveForward + rightVec * moveStrafe) * effectiveMaxSpeed
+                let response = min(1.0, realDt * 6.0)
                 shipVelocityMetersPerSec += (desiredVelocity - shipVelocityMetersPerSec) * response
-            } else if throttle > 0.001 {
-                shipVelocityMetersPerSec += forwardVec * (effectiveMaxSpeed * throttle * 0.25) * realDt
+
+                shipVisualNode.eulerAngles = SCNVector3(0, 0, 0)
+            } else {
+                let targetYawRate = -Double(stickInput.x) * 1.45
+                let targetPitchRate = -Double(stickInput.y) * 1.15
+                let damp = min(1.0, realDt * 6.5)
+                angularVelYaw += (targetYawRate - angularVelYaw) * damp
+                angularVelPitch += (targetPitchRate - angularVelPitch) * damp
+
+                if abs(angularVelYaw) > 0.0001 || abs(angularVelPitch) > 0.0001 {
+                    let qYaw = simd_quatd(angle: angularVelYaw * realDt, axis: SIMD3(0, 1, 0))
+                    let qPitch = simd_quatd(angle: angularVelPitch * realDt, axis: SIMD3(1, 0, 0))
+                    shipOrientation = simd_normalize(shipOrientation * qYaw * qPitch)
+                }
+
+                let desiredBank = Float(angularVelYaw * 0.35)
+                let desiredPitchVis = Float(angularVelPitch * 0.18)
+                shipVisualNode.eulerAngles.z += (desiredBank - shipVisualNode.eulerAngles.z) * Float(min(1.0, realDt * 8.0))
+                shipVisualNode.eulerAngles.x += (desiredPitchVis - shipVisualNode.eulerAngles.x) * Float(min(1.0, realDt * 8.0))
+
+                let targetStickX = Float(stickInput.y * 0.32)
+                let targetStickZ = Float(-stickInput.x * 0.32)
+                cockpitStickPivot.eulerAngles.x += (targetStickX - cockpitStickPivot.eulerAngles.x) * Float(min(1.0, realDt * 12.0))
+                cockpitStickPivot.eulerAngles.z += (targetStickZ - cockpitStickPivot.eulerAngles.z) * Float(min(1.0, realDt * 12.0))
+                let targetThrottleAngle = Float(0.35 - throttle * 0.78)
+                cockpitThrottlePivot.eulerAngles.x += (targetThrottleAngle - cockpitThrottlePivot.eulerAngles.x) * Float(min(1.0, realDt * 10.0))
+
+                cameraLagYaw += (Float(-angularVelYaw * 0.14) - cameraLagYaw) * Float(min(1.0, realDt * 5.0))
+                cameraLagPitch += (Float(-angularVelPitch * 0.10) - cameraLagPitch) * Float(min(1.0, realDt * 5.0))
+                if isThirdPerson {
+                    cameraBoomNode.eulerAngles = SCNVector3(orbitPitch + cameraLagPitch, orbitYaw + cameraLagYaw, 0)
+                }
+
+                let desiredVelocity = forwardVec * (effectiveMaxSpeed * throttle)
+                if flightAssist {
+                    let response = min(1.0, realDt * 3.5)
+                    shipVelocityMetersPerSec += (desiredVelocity - shipVelocityMetersPerSec) * response
+                } else {
+                    if throttle > 0.001 {
+                        shipVelocityMetersPerSec += forwardVec * (effectiveMaxSpeed * throttle * 0.25) * realDt
+                    }
+                    if !nearestBody.isStar && nearestSurfaceDist < 120_000 {
+                        let gAccel = (CelestialBody.G * nearestBody.massKg) / max(1.0, nearestDistFromCenter * nearestDistFromCenter)
+                        shipVelocityMetersPerSec -= upWorld * gAccel * realDt
+                    }
+                }
+            }
+        }
+
+        let atmoH = nearestBody.atmosphereHeightMeters
+        let preAtmoDensity: Double
+        if atmoH > 0 && nearestSurfaceDist < atmoH {
+            let hNorm = max(0.0, nearestSurfaceDist / atmoH)
+            preAtmoDensity = exp(-hNorm * 3.8) * (1.0 - hNorm)
+        } else {
+            preAtmoDensity = 0.0
+        }
+
+        let preSpeed = simd_length(shipVelocityMetersPerSec)
+        if !landedState && flightAssist && preAtmoDensity > 0.05 && preSpeed > 12_000.0 && !isFreeCamera {
+            let drag = min(0.85, preAtmoDensity * realDt * 1.4)
+            shipVelocityMetersPerSec *= (1.0 - drag)
+        }
+
+        let flightDt = (isTimePaused || isFreeCamera) ? realDt : (realDt * max(1.0, abs(warp)))
+        if !landedState {
+            shipPositionMeters += shipVelocityMetersPerSec * flightDt
+        }
+
+        if nearestBody.isLandable && nearestSurfaceDist < 350_000 {
+            upWorld = safeNormalize(shipPositionMeters - nearestBodyPos, fallback: SIMD3<Double>(0, 1, 0))
+            let localDir = invNearestRot.act(upWorld)
+            let sample = SurfaceTerrainEngine.sampleTerrain(localDir: localDir, body: nearestBody)
+            let effectiveGround = (nearestBody.id == "earth") ? max(0.0, sample.heightMeters) : sample.heightMeters
+            currentGroundHeightMeters = effectiveGround
+
+            let hoverClearance = isFreeCamera ? 2.0 : 2.8
+            let minDistFromCenter = nearestBody.radiusMeters + effectiveGround + hoverClearance
+            let currentDist = simd_length(shipPositionMeters - nearestBodyPos)
+
+            if currentDist <= minDistFromCenter {
+                shipPositionMeters = nearestBodyPos + upWorld * minDistFromCenter
+                let vRadial = simd_dot(shipVelocityMetersPerSec, upWorld)
+                if vRadial < 0 {
+                    shipVelocityMetersPerSec -= upWorld * vRadial
+                }
+                if !isFreeCamera && throttle < 0.15 && !sample.isWater {
+                    landedState = true
+                    shipVelocityMetersPerSec = .zero
+                }
             }
         }
 
@@ -1211,9 +1537,21 @@ final class SpaceSimulationController: ObservableObject {
             r: Float(shipOrientation.real)
         )
 
-        let flightDt = (isTimePaused || isFreeCamera) ? realDt : (realDt * max(1.0, abs(warp)))
-        shipPositionMeters += shipVelocityMetersPerSec * flightDt
         let actualSpeed = simd_length(shipVelocityMetersPerSec)
+        let updatedSurfaceDist = max(0.0, simd_length(shipPositionMeters - nearestBodyPos) - nearestBody.radiusMeters)
+        let radarAlt = max(0.0, updatedSurfaceDist - currentGroundHeightMeters)
+        upWorld = safeNormalize(shipPositionMeters - nearestBodyPos, fallback: SIMD3<Double>(0, 1, 0))
+
+        let atmoDensity: Double
+        if atmoH > 0 && updatedSurfaceDist < atmoH {
+            let hNorm = max(0.0, updatedSurfaceDist / atmoH)
+            atmoDensity = exp(-hNorm * 3.8) * (1.0 - hNorm)
+        } else {
+            atmoDensity = 0.0
+        }
+        let heatValue = (atmoDensity > 0.03 && actualSpeed > 2_500.0)
+            ? min(1.0, atmoDensity * ((actualSpeed - 2_500.0) / 8_000.0))
+            : 0.0
 
         if actualSpeed > 1.0 {
             let velDir = simd_normalize(shipVelocityMetersPerSec)
@@ -1232,22 +1570,97 @@ final class SpaceSimulationController: ObservableObject {
         let flameScale = Float(max(0.05, throttle * (1.0 + Double(speedIndex) * 0.22)))
         for fNode in exhaustNodes {
             fNode.scale = SCNVector3(1.0, flameScale, 1.0)
-            fNode.isHidden = throttle <= 0.01 || isFreeCamera
+            fNode.isHidden = throttle <= 0.01 || isFreeCamera || landedState
         }
 
-        let sunDirWorld = simd_normalize(-shipPositionMeters)
+        let sunDirWorld = safeNormalize(-shipPositionMeters, fallback: SIMD3<Double>(1, 0, 0))
         let lookTarget = SIMD3<Float>(Float(-sunDirWorld.x), Float(-sunDirWorld.y), Float(-sunDirWorld.z))
         sunLightNode.simdLook(at: lookTarget, up: SIMD3<Float>(0, 1, 0), localFront: SIMD3<Float>(0, 0, -1))
 
         let camWorldQuat = cameraNode.simdWorldOrientation
         let invCamQuat = simd_inverse(camWorldQuat)
 
+        let terrainVisible = nearestBody.isLandable && updatedSurfaceDist < 240_000
+        if terrainVisible {
+            let movedFromAnchor = simd_length(shipPositionMeters - lastTerrainAnchorWorld)
+            let needsRebuild = (activeSurfaceBodyId != nearestBody.id)
+                || (lastTerrainAltitude < 0)
+                || (abs(updatedSurfaceDist - lastTerrainAltitude) > max(150.0, lastTerrainAltitude * 0.14))
+                || (movedFromAnchor > max(600.0, updatedSurfaceDist * 0.18))
+
+            if needsRebuild {
+                let res = SurfaceTerrainEngine.buildTerrainGeometry(
+                    body: nearestBody,
+                    bodyPos: nearestBodyPos,
+                    anchorWorld: shipPositionMeters,
+                    invPlanetRot: invNearestRot,
+                    altitudeMeters: max(50.0, updatedSurfaceDist),
+                    compress: { [self] rel in self.compressToScene(rel) }
+                )
+                terrainMeshNode.geometry = res.terrain
+                oceanMeshNode.geometry = res.ocean
+                oceanMeshNode.isHidden = (res.ocean == nil)
+                activeSurfaceBodyId = nearestBody.id
+                lastTerrainAnchorWorld = shipPositionMeters
+                lastTerrainAltitude = updatedSurfaceDist
+            }
+
+            terrainRootNode.isHidden = false
+            terrainRootNode.simdPosition = SIMD3<Float>(
+                Float(lastTerrainAnchorWorld.x - shipPositionMeters.x),
+                Float(lastTerrainAnchorWorld.y - shipPositionMeters.y),
+                Float(lastTerrainAnchorWorld.z - shipPositionMeters.z)
+            )
+            terrainRootNode.opacity = CGFloat(max(0.0, min(1.0, (240_000.0 - updatedSurfaceDist) / 100_000.0)))
+        } else {
+            terrainRootNode.isHidden = true
+            activeSurfaceBodyId = nil
+            lastTerrainAltitude = -1
+        }
+
+        if atmoH > 0 && atmoDensity > 0.002 {
+            skyDomeNode.isHidden = false
+            let pal = nearestBody.atmospherePalette
+            let toSunBody = safeNormalize(-nearestBodyPos, fallback: SIMD3<Double>(1, 0, 0))
+            let sunElev = max(-1.0, min(1.0, simd_dot(toSunBody, upWorld)))
+            let dayFactor = max(0.0, min(1.0, (sunElev + 0.22) / 0.40))
+
+            let sunView = invCamQuat.act(SIMD3<Float>(Float(toSunBody.x), Float(toSunBody.y), Float(toSunBody.z)))
+            let upView = invCamQuat.act(SIMD3<Float>(Float(upWorld.x), Float(upWorld.y), Float(upWorld.z)))
+
+            skyDomeMaterial?.setValue(NSValue(scnVector3: SCNVector3(sunView.x, sunView.y, sunView.z)), forKey: "sunDirView")
+            skyDomeMaterial?.setValue(NSValue(scnVector3: SCNVector3(upView.x, upView.y, upView.z)), forKey: "upDirView")
+            skyDomeMaterial?.setValue(NSValue(scnVector3: SCNVector3(pal.zenith.x, pal.zenith.y, pal.zenith.z)), forKey: "zenithCol")
+            skyDomeMaterial?.setValue(NSValue(scnVector3: SCNVector3(pal.horizon.x, pal.horizon.y, pal.horizon.z)), forKey: "horizonCol")
+            skyDomeMaterial?.setValue(NSValue(scnVector3: SCNVector3(pal.sunset.x, pal.sunset.y, pal.sunset.z)), forKey: "sunsetCol")
+            skyDomeMaterial?.setValue(NSNumber(value: Float(atmoDensity)), forKey: "atmoDensity")
+
+            let fogBrightness = CGFloat(0.12 + 0.88 * dayFactor)
+            let twilightMix = Float(exp(-pow((sunElev + 0.02) * 5.0, 2.0))) * 0.45
+            let fogVec = pal.fog + (pal.sunset - pal.fog) * twilightMix
+            scene.fogColor = UIColor(
+                red: CGFloat(fogVec.x) * fogBrightness,
+                green: CGFloat(fogVec.y) * fogBrightness,
+                blue: CGFloat(fogVec.z) * fogBrightness,
+                alpha: 1.0
+            )
+            let fogDensity = max(0.02, atmoDensity)
+            scene.fogStartDistance = CGFloat(max(2_500.0, 14_000.0 / fogDensity))
+            scene.fogEndDistance = CGFloat(max(24_000.0, 160_000.0 / fogDensity))
+
+            ambientLightNode.light?.intensity = 22.0 + CGFloat(atmoDensity * dayFactor * 210.0)
+        } else {
+            skyDomeNode.isHidden = true
+            scene.fogEndDistance = 0
+            ambientLightNode.light?.intensity = 22.0
+        }
+
         var newMarkers: [BodyScreenMarker] = []
         let viewBounds = (renderer as? SCNView)?.bounds ?? CGRect(x: 0, y: 0, width: 844, height: 390)
 
         for body in UniverseCatalog.bodies {
             guard let node = bodyNodes[body.id] else { continue }
-            let bodyPos = body.currentPosition(simulationTime: simulationTimeSeconds, allBodies: UniverseCatalog.bodies)
+            let bodyPos = cachedPositions[body.id] ?? body.currentPosition(simulationTime: simulationTimeSeconds, allBodies: UniverseCatalog.bodies)
             let rel = bodyPos - shipPositionMeters
             let (renderPos, scaleFactor) = compressToScene(rel)
             let renderRadius = max(0.35, body.radiusMeters * scaleFactor)
@@ -1262,8 +1675,22 @@ final class SpaceSimulationController: ObservableObject {
                 mesh.eulerAngles.y = spinAngle
             }
 
+            if terrainVisible && body.id == nearestBody.id {
+                let orbitFade = CGFloat(max(0.0, min(1.0, (updatedSurfaceDist - 100_000.0) / 60_000.0)))
+                let hideOrbitShell = updatedSurfaceDist <= 100_000.0
+                planetMeshNodes[body.id]?.opacity = orbitFade
+                planetMeshNodes[body.id]?.isHidden = hideOrbitShell
+                atmoNodes[body.id]?.opacity = orbitFade
+                atmoNodes[body.id]?.isHidden = hideOrbitShell
+            } else {
+                planetMeshNodes[body.id]?.opacity = 1.0
+                planetMeshNodes[body.id]?.isHidden = false
+                atmoNodes[body.id]?.opacity = 1.0
+                atmoNodes[body.id]?.isHidden = false
+            }
+
             if !body.isStar {
-                let toSunWorld = simd_normalize(-bodyPos)
+                let toSunWorld = safeNormalize(-bodyPos, fallback: SIMD3<Double>(1, 0, 0))
                 let toSunF = SIMD3<Float>(Float(toSunWorld.x), Float(toSunWorld.y), Float(toSunWorld.z))
 
                 let invTilt = simd_quatf(angle: -Float(body.axialTiltRad), axis: SIMD3<Float>(0, 0, 1))
@@ -1275,7 +1702,8 @@ final class SpaceSimulationController: ObservableObject {
                 atmoMaterials[body.id]?.setValue(NSValue(scnVector3: SCNVector3(sunView.x, sunView.y, sunView.z)), forKey: "sunDirView")
             }
 
-            if showMarkers {
+            let hideSurfaceMarker = terrainVisible && body.id == nearestBody.id && updatedSurfaceDist < 100_000.0
+            if showMarkers && !hideSurfaceMarker {
                 let projected = renderer.projectPoint(node.position)
                 if projected.z > 0.0 && projected.z < 1.0 {
                     let px = CGFloat(projected.x)
@@ -1300,10 +1728,34 @@ final class SpaceSimulationController: ObservableObject {
             updateOrbitLines()
         }
 
-        let targetPos = targetBody.currentPosition(simulationTime: simulationTimeSeconds, allBodies: UniverseCatalog.bodies)
+        let targetPos = cachedPositions[targetBody.id] ?? targetBody.currentPosition(simulationTime: simulationTimeSeconds, allBodies: UniverseCatalog.bodies)
         let surfaceDist = max(0, simd_length(targetPos - shipPositionMeters) - targetBody.radiusMeters)
         let currentDateStr = Self.dateFormatter.string(from: baseEpochDate.addingTimeInterval(simulationTimeSeconds))
         let autoSpeedStr = Self.formatSpeed(autoMaxSpeedMps)
+
+        let nearSurface = (nearestBody.isLandable && updatedSurfaceDist < 240_000) || (atmoH > 0 && updatedSurfaceDist < atmoH)
+        let zoneStr: String
+        if landedState {
+            zoneStr = "ПОСАДКА"
+        } else if atmoH > 0 && updatedSurfaceDist < atmoH {
+            zoneStr = "АТМОСФЕРА"
+        } else if nearestBody.isLandable && updatedSurfaceDist < 240_000 {
+            zoneStr = "СНИЖЕНИЕ"
+        } else {
+            zoneStr = ""
+        }
+
+        let altStr: String
+        if landedState {
+            altStr = "НА ПОВЕРХНОСТИ"
+        } else if radarAlt < 1_000 {
+            altStr = String(format: "ВЫС: %.0f м", radarAlt)
+        } else {
+            altStr = String(format: "ВЫС: %.1f км", radarAlt / 1_000.0)
+        }
+
+        let currentLanded = landedState
+        let currentCanLand = targetBody.isLandable
 
         DispatchQueue.main.async {
             self.distanceText = Self.formatDistance(surfaceDist)
@@ -1312,12 +1764,19 @@ final class SpaceSimulationController: ObservableObject {
             self.etaText = actualSpeed > 1.0 ? Self.formatTime(surfaceDist / actualSpeed) : "Стоп"
             self.simDateText = currentDateStr
             self.screenMarkers = self.showMarkers ? newMarkers : []
+            self.isLanded = currentLanded
+            self.isNearSurface = nearSurface
+            self.surfaceAltitudeText = altStr
+            self.atmosphereZoneText = zoneStr
+            self.reentryHeat = heatValue
+            self.canLandOnTarget = currentCanLand
         }
     }
 
     static func formatDistance(_ meters: Double) -> String {
         if meters < 1_000 { return String(format: "%.0f м", meters) }
         let km = meters / 1_000
+        if km < 1_000 { return String(format: "%.1f км", km) }
         if km < 1_000_000 { return String(format: "%.1f тыс. км", km / 1_000) }
         let au = meters / UniverseCatalog.au
         if au < 10_000 { return String(format: "%.3f а.е.", au) }
@@ -1462,6 +1921,35 @@ struct ContentView: View {
         ZStack {
             SceneViewContainer(sim: sim)
 
+            if sim.reentryHeat > 0.04 {
+                ZStack {
+                    RadialGradient(
+                        colors: [
+                            .clear,
+                            Color.orange.opacity(0.22 * sim.reentryHeat),
+                            Color.red.opacity(0.48 * sim.reentryHeat)
+                        ],
+                        center: .center,
+                        startRadius: 120,
+                        endRadius: 460
+                    )
+                    .ignoresSafeArea()
+
+                    VStack {
+                        Spacer()
+                        Text("ВХОД В АТМОСФЕРУ")
+                            .font(.system(size: 11, weight: .bold, design: .monospaced))
+                            .foregroundColor(.orange)
+                            .padding(.horizontal, 12).padding(.vertical, 5)
+                            .background(Color.black.opacity(0.72))
+                            .overlay(Capsule().stroke(Color.orange.opacity(0.75), lineWidth: 1))
+                            .clipShape(Capsule())
+                            .padding(.bottom, 108)
+                    }
+                }
+                .allowsHitTesting(false)
+            }
+
             if sim.showMarkers {
                 ForEach(sim.screenMarkers) { marker in
                     Button(action: {
@@ -1572,6 +2060,43 @@ struct ContentView: View {
                 .foregroundColor(.white)
                 .padding(.horizontal, 12)
                 .padding(.top, 10)
+
+                if sim.isNearSurface {
+                    HStack(spacing: 8) {
+                        Text(sim.atmosphereZoneText)
+                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                            .foregroundColor(sim.isLanded ? .green : .orange)
+
+                        Text(sim.surfaceAltitudeText)
+                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                            .foregroundColor(.white)
+
+                        if sim.isLanded {
+                            Button("ВЗЛЁТ") {
+                                sim.takeoffFromSurface()
+                            }
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 9).padding(.vertical, 4)
+                            .background(Color.green.opacity(0.85))
+                            .clipShape(Capsule())
+                        } else if !sim.isFreeCamera {
+                            Button("ГОРИЗОНТ") {
+                                sim.levelToHorizon()
+                            }
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 9).padding(.vertical, 4)
+                            .background(Color.cyan.opacity(0.45))
+                            .clipShape(Capsule())
+                        }
+                    }
+                    .padding(.horizontal, 12).padding(.vertical, 5)
+                    .background(Color.black.opacity(0.72))
+                    .overlay(Capsule().stroke(Color.cyan.opacity(0.4), lineWidth: 1))
+                    .clipShape(Capsule())
+                    .padding(.top, 2)
+                }
 
                 Spacer()
 
@@ -1777,13 +2302,26 @@ struct ContentView: View {
                         .padding(.vertical, 7)
                         .background(Color.blue)
                         .cornerRadius(8)
+
+                        if b.isLandable {
+                            Button("Посадка") {
+                                sim.warpToSurfaceApproach(b)
+                                showInfo = false
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 7)
+                            .background(Color.green.opacity(0.85))
+                            .cornerRadius(8)
+                        }
                     }
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
                     .font(.caption.bold())
                     .padding(.top, 4)
                 }
                 .foregroundColor(.white)
                 .padding(14)
-                .frame(maxWidth: 340)
+                .frame(maxWidth: 380)
                 .background(Color.black.opacity(0.92))
                 .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.cyan.opacity(0.5), lineWidth: 1))
                 .cornerRadius(16)
@@ -1824,6 +2362,17 @@ struct ContentView: View {
                                     .padding(.horizontal, 10).padding(.vertical, 6)
                                     .background(Color.blue)
                                     .cornerRadius(8)
+
+                                    if body.isLandable {
+                                        Button("Посадка") {
+                                            sim.warpToSurfaceApproach(body)
+                                            showCatalog = false
+                                        }
+                                        .font(.caption.bold())
+                                        .padding(.horizontal, 10).padding(.vertical, 6)
+                                        .background(Color.green.opacity(0.85))
+                                        .cornerRadius(8)
+                                    }
                                 }
                                 .padding(8)
                                 .background(Color.white.opacity(0.08))
@@ -1834,7 +2383,7 @@ struct ContentView: View {
                 }
                 .foregroundColor(.white)
                 .padding()
-                .frame(maxWidth: 390, maxHeight: 290)
+                .frame(maxWidth: 440, maxHeight: 290)
                 .background(Color.black.opacity(0.92))
                 .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.cyan.opacity(0.4), lineWidth: 1))
                 .cornerRadius(16)
