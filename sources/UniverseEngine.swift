@@ -3,6 +3,7 @@ import simd
 
 enum BodyCategory: String, CaseIterable, Identifiable {
     case all = "Все"
+    case stations = "Станции"
     case solar = "Солнечная"
     case moons = "Спутники"
     case stars = "Звёзды"

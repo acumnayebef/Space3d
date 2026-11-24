@@ -102,6 +102,13 @@ final class SpaceSimulationController: ObservableObject {
     @Published var evaScannerOpen: Bool = false
     @Published var evaScanReport: SurfaceScanReport? = nil
     @Published var isMainMenu: Bool = true
+    @Published var pilotProfile: PilotProfile = PilotProfile.load()
+    @Published var dockedStation: SpaceStation? = nil
+    @Published var nearbyStation: SpaceStation? = nil
+    @Published var nearbyStationDistText: String = ""
+    @Published var isFSSOpen: Bool = false
+    @Published var fssFrequencyMHz: Double = 42.0
+    @Published var lastFSSMessage: String = ""
 
     let speedSteps: [(label: String, mps: Double)] = [
         ("1.5 км/с", 1_500),
@@ -153,11 +160,15 @@ final class SpaceSimulationController: ObservableObject {
     private var evaWalkPhase: Double = 0.0
     private var evaRefForwardLocal: SIMD3<Double> = SIMD3<Double>(0, 0, -1)
     private var jetpackFuelState: Double = 1.0
+    private var jetpackDrainState: Double = 0.28
     private var hasPropsForCurrentAnchor: Bool = false
     private var activeTerrainCollision: SurfaceTerrainEngine.TerrainCollisionGrid? = nil
     private var parkedShipBodyId: String?
     private var parkedShipLocalPos: SIMD3<Double> = .zero
     private var parkedShipLocalOrient: simd_quatd = simd_quatd(angle: 0, axis: SIMD3<Double>(0, 1, 0))
+    private var stationNodes: [String: SCNNode] = [:]
+    private var dockedState: Bool = false
+    private var dockedStationId: String? = nil
 
     private static let dateFormatter: DateFormatter = {
         let df = DateFormatter()
@@ -184,6 +195,7 @@ final class SpaceSimulationController: ObservableObject {
 
     init() {
         simDateText = Self.dateFormatter.string(from: baseEpochDate)
+        jetpackDrainState = pilotProfile.jetpackDrainPerSec
         setupScene()
     }
 
@@ -256,6 +268,7 @@ final class SpaceSimulationController: ObservableObject {
         scene.rootNode.addChildNode(orbitLinesNode)
         buildSpaceDust()
         buildCelestialBodies()
+        buildSpaceStations()
     }
 
     private func buildSpaceDust() {
@@ -483,6 +496,14 @@ final class SpaceSimulationController: ObservableObject {
                 ctx.setFillColor(col.withAlphaComponent(alpha).cgColor)
                 ctx.fillEllipse(in: CGRect(x: x - Double(dotR) * 0.5, y: y - Double(dotR) * 0.5, width: Double(dotR), height: Double(dotR)))
             }
+        }
+    }
+
+    private func buildSpaceStations() {
+        for station in EliteSystemsEngine.stations {
+            let node = EliteSystemsEngine.buildStationNode(for: station)
+            scene.rootNode.addChildNode(node)
+            stationNodes[station.id] = node
         }
     }
 
@@ -1550,6 +1571,10 @@ final class SpaceSimulationController: ObservableObject {
         if walkingState {
             boardShip()
         }
+        dockedState = false
+        dockedStationId = nil
+        dockedStation = nil
+        isFSSOpen = false
         targetBody = body
         throttle = 0
         shipVelocityMetersPerSec = .zero
@@ -1599,6 +1624,10 @@ final class SpaceSimulationController: ObservableObject {
         if walkingState {
             boardShip()
         }
+        dockedState = false
+        dockedStationId = nil
+        dockedStation = nil
+        isFSSOpen = false
         targetBody = body
         throttle = 0
         shipVelocityMetersPerSec = .zero
@@ -1693,6 +1722,199 @@ final class SpaceSimulationController: ObservableObject {
             localDir: invRot.act(upWorld),
             elevationMeters: ground.height
         )
+        let evaRecId = "eva_\(nearestBody.id)"
+        if !pilotProfile.scans.contains(where: { $0.id == evaRecId }) {
+            let payout = Int((3_000.0 * pilotProfile.fssPayoutMultiplier).rounded())
+            pilotProfile.scans.append(ExplorationScanRecord(
+                id: evaRecId,
+                bodyId: nearestBody.id,
+                bodyName: nearestBody.name,
+                scanType: "Поверхностная геология (EVA)",
+                payoutCredits: payout,
+                sold: false
+            ))
+            pilotProfile.save()
+        }
+    }
+
+    func alignToStation(_ station: SpaceStation) {
+        let stPos = station.currentPosition(
+            simulationTime: simulationTimeSeconds,
+            cachedPositions: [:],
+            allBodies: UniverseCatalog.bodies
+        )
+        let dir = safeNormalize(stPos - shipPositionMeters)
+        let forward = SIMD3<Double>(0, 0, -1)
+        let dot = simd_dot(forward, dir)
+        if dot < -0.9999 {
+            shipOrientation = simd_quatd(angle: .pi, axis: SIMD3(0, 1, 0))
+        } else if dot < 0.9999 {
+            let axis = safeNormalize(simd_cross(forward, dir), fallback: SIMD3(0, 1, 0))
+            shipOrientation = simd_quatd(angle: acos(max(-1.0, min(1.0, dot))), axis: axis)
+        }
+        orbitYaw = 0
+        orbitPitch = -0.14
+        angularVelYaw = 0
+        angularVelPitch = 0
+        updateCameraMode()
+    }
+
+    func warpToStation(_ station: SpaceStation) {
+        if walkingState {
+            boardShip()
+        }
+        dockedState = false
+        dockedStationId = nil
+        dockedStation = nil
+        isFSSOpen = false
+        throttle = 0
+        shipVelocityMetersPerSec = .zero
+        landedState = false
+        isLanded = false
+        lastTerrainAltitude = -1
+        activeSurfaceBodyId = nil
+        activeTerrainCollision = nil
+        lastTrackedBodyId = nil
+        hasPropsForCurrentAnchor = false
+        terrainRootNode.isHidden = true
+        skyDomeNode.isHidden = true
+        surfacePropsNode.isHidden = true
+        reentryHeat = 0.0
+
+        if let parent = UniverseCatalog.bodies.first(where: { $0.id == station.parentBodyId }) {
+            targetBody = parent
+        }
+        let stPos = station.currentPosition(
+            simulationTime: simulationTimeSeconds,
+            cachedPositions: [:],
+            allBodies: UniverseCatalog.bodies
+        )
+        let offsetDir = safeNormalize(SIMD3<Double>(0.40, 0.25, 0.88))
+        shipPositionMeters = stPos + offsetDir * 1_400.0
+        alignToStation(station)
+    }
+
+    func dockAtNearbyStation() {
+        guard !walkingState, !landedState, let st = nearbyStation else { return }
+        dockedState = true
+        dockedStationId = st.id
+        dockedStation = st
+        isFSSOpen = false
+        throttle = 0
+        shipVelocityMetersPerSec = .zero
+        alignToStation(st)
+    }
+
+    func undockFromStation() {
+        guard dockedState, let st = dockedStation else {
+            dockedState = false
+            dockedStationId = nil
+            dockedStation = nil
+            return
+        }
+        let stPos = st.currentPosition(
+            simulationTime: simulationTimeSeconds,
+            cachedPositions: [:],
+            allBodies: UniverseCatalog.bodies
+        )
+        let rawRel = shipPositionMeters - stPos
+        let outDir = simd_length_squared(rawRel) > 1.0 ? safeNormalize(rawRel) : SIMD3<Double>(0, 0, 1)
+        shipPositionMeters = stPos + outDir * 900.0
+        dockedState = false
+        dockedStationId = nil
+        dockedStation = nil
+        shipVelocityMetersPerSec = outDir * 40.0
+        throttle = 0
+    }
+
+    func buyCommodity(_ commodity: TradeCommodity, qty: Int) {
+        guard let st = dockedStation, qty > 0 else { return }
+        let unitPrice = commodity.price(at: st.economy)
+        let freeSpace = pilotProfile.cargoCapacityTons - pilotProfile.usedCargoTons
+        let maxAffordable = pilotProfile.credits / max(1, unitPrice)
+        let count = min(qty, min(freeSpace, maxAffordable))
+        guard count > 0 else { return }
+        pilotProfile.credits -= count * unitPrice
+        pilotProfile.cargo[commodity.id, default: 0] += count
+        pilotProfile.save()
+    }
+
+    func sellCommodity(_ commodity: TradeCommodity, qty: Int) {
+        guard let st = dockedStation, qty > 0 else { return }
+        let held = pilotProfile.cargo[commodity.id] ?? 0
+        let count = min(qty, held)
+        guard count > 0 else { return }
+        let unitPrice = commodity.price(at: st.economy)
+        pilotProfile.credits += count * unitPrice
+        let remaining = held - count
+        if remaining > 0 {
+            pilotProfile.cargo[commodity.id] = remaining
+        } else {
+            pilotProfile.cargo.removeValue(forKey: commodity.id)
+        }
+        pilotProfile.save()
+    }
+
+    func sellAllCartographics() {
+        var total = 0
+        for i in pilotProfile.scans.indices where !pilotProfile.scans[i].sold {
+            total += pilotProfile.scans[i].payoutCredits
+            pilotProfile.scans[i].sold = true
+        }
+        guard total > 0 else { return }
+        pilotProfile.credits += total
+        pilotProfile.save()
+    }
+
+    func upgradeCargo() {
+        guard let cost = pilotProfile.nextCargoUpgradeCost, pilotProfile.credits >= cost else { return }
+        pilotProfile.credits -= cost
+        pilotProfile.cargoLevel += 1
+        pilotProfile.save()
+    }
+
+    func upgradeFSS() {
+        guard let cost = pilotProfile.nextFSSUpgradeCost, pilotProfile.credits >= cost else { return }
+        pilotProfile.credits -= cost
+        pilotProfile.fssLevel += 1
+        pilotProfile.save()
+    }
+
+    func upgradeJetpack() {
+        guard let cost = pilotProfile.nextJetpackUpgradeCost, pilotProfile.credits >= cost else { return }
+        pilotProfile.credits -= cost
+        pilotProfile.jetpackLevel += 1
+        jetpackDrainState = pilotProfile.jetpackDrainPerSec
+        pilotProfile.save()
+    }
+
+    func autoTuneFSSToTarget() {
+        fssFrequencyMHz = EliteSystemsEngine.fssFrequencyMHz(for: targetBody)
+        lastFSSMessage = "Настройка на \(targetBody.name): \(String(format: "%.1f", fssFrequencyMHz)) МГц"
+    }
+
+    func performFSSScan() {
+        let targetFreq = EliteSystemsEngine.fssFrequencyMHz(for: targetBody)
+        guard abs(fssFrequencyMHz - targetFreq) <= 4.0 else {
+            lastFSSMessage = "Настройте частоту на сигнал цели (±4 МГц)"
+            return
+        }
+        let recId = "fss_\(targetBody.id)"
+        guard !pilotProfile.scans.contains(where: { $0.id == recId }) else {
+            lastFSSMessage = "\(targetBody.name): данные уже записаны"
+            return
+        }
+        let payout = Int((Double(EliteSystemsEngine.fssBasePayout(for: targetBody)) * pilotProfile.fssPayoutMultiplier).rounded())
+        pilotProfile.scans.append(ExplorationScanRecord(
+            id: recId,
+            bodyId: targetBody.id,
+            bodyName: targetBody.name,
+            scanType: "FSS-спектроскопия (\(targetBody.type))",
+            payoutCredits: payout,
+            sold: false
+        ))
+        pilotProfile.save()
+        lastFSSMessage = "Сканирование завершено: +\(payout) CR (сдайте на станции)"
     }
 
     func landAtCurrentSpot() {
@@ -2030,7 +2252,7 @@ final class SpaceSimulationController: ObservableObject {
             if evaJetpackActive && jetpackFuelState > 0.01 {
                 let thrust = gSurface + 9.5
                 evaVerticalVel = min(22.0, evaVerticalVel + thrust * realDt)
-                jetpackFuelState = max(0.0, jetpackFuelState - realDt * 0.28)
+                jetpackFuelState = max(0.0, jetpackFuelState - realDt * jetpackDrainState)
                 if jetpackFuelState <= 0.01 {
                     exhaustJetpackFuel = true
                 }
@@ -2533,6 +2755,54 @@ final class SpaceSimulationController: ObservableObject {
         let remainingMarkers = max(0, 18 - prioritizedMarkers.count)
         let newMarkers = prioritizedMarkers + otherMarkers.prefix(remainingMarkers).map { $0.marker }
 
+        var closestStation: SpaceStation? = nil
+        var closestStationDist = Double.greatestFiniteMagnitude
+        var dockedStationWorldPos: SIMD3<Double>? = nil
+
+        for station in EliteSystemsEngine.stations {
+            let stPos = station.currentPosition(
+                simulationTime: simulationTimeSeconds,
+                cachedPositions: cachedPositions,
+                allBodies: UniverseCatalog.bodies
+            )
+            if dockedState && station.id == dockedStationId {
+                dockedStationWorldPos = stPos
+            }
+            let rel = stPos - shipPositionMeters
+            let dist = simd_length(rel)
+            if dist < closestStationDist {
+                closestStationDist = dist
+                closestStation = station
+            }
+            if let stNode = stationNodes[station.id] {
+                let (renderPos, scaleFactor) = compressToScene(rel)
+                let renderRadius = Float(station.radiusMeters * scaleFactor)
+                stNode.isHidden = renderRadius < 0.02 || dist > 50_000_000.0
+                if !stNode.isHidden {
+                    stNode.simdPosition = renderPos
+                    stNode.simdScale = SIMD3<Float>(repeating: renderRadius)
+                    stNode.eulerAngles.z += Float(realDt * 0.22)
+                }
+            }
+        }
+
+        if dockedState, let stPos = dockedStationWorldPos {
+            shipPositionMeters = stPos + SIMD3<Double>(0, 0, 500.0)
+            shipVelocityMetersPerSec = .zero
+            if let sid = dockedStationId,
+               let stNode = stationNodes[sid],
+               let st = EliteSystemsEngine.stations.first(where: { $0.id == sid }) {
+                let rel = stPos - shipPositionMeters
+                let (renderPos, scaleFactor) = compressToScene(rel)
+                stNode.isHidden = false
+                stNode.simdPosition = renderPos
+                stNode.simdScale = SIMD3<Float>(repeating: Float(st.radiusMeters * scaleFactor))
+            }
+        }
+
+        let detectedStation: SpaceStation? = (!walkingState && !landedState && !dockedState && !isMainMenu && closestStationDist < 20_000.0) ? closestStation : nil
+        let detectedStationDistStr = detectedStation != nil ? Self.formatDistance(closestStationDist) : ""
+
         if isMainMenu {
             orbitLinesNode.isHidden = true
         } else if frameCounter % 2 == 0 {
@@ -2601,6 +2871,8 @@ final class SpaceSimulationController: ObservableObject {
             }
             self.evaShipDistanceText = evaShipDistStr
             self.evaTempText = evaTempStr
+            self.nearbyStation = detectedStation
+            self.nearbyStationDistText = detectedStationDistStr
         }
     }
 
@@ -3012,7 +3284,7 @@ struct ContentView: View {
                 .allowsHitTesting(false)
             }
 
-            if sim.showMarkers && !sim.isWalkingOnSurface && !sim.isMainMenu {
+            if sim.showMarkers && !sim.isWalkingOnSurface && !sim.isMainMenu && sim.dockedStation == nil {
                 ForEach(sim.screenMarkers) { marker in
                     Button(action: {
                         if let found = UniverseCatalog.bodies.first(where: { $0.id == marker.id }) {
@@ -3042,7 +3314,7 @@ struct ContentView: View {
                 }
             }
 
-            if !sim.isMainMenu {
+            if !sim.isMainMenu && sim.dockedStation == nil {
                 VStack {
                 if sim.isWalkingOnSurface {
                     HStack(spacing: 8) {
@@ -3242,7 +3514,31 @@ struct ContentView: View {
                             .background(Color.black.opacity(0.72))
                             .clipShape(Capsule())
 
+                        Text("\(sim.pilotProfile.credits) CR")
+                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                            .foregroundColor(.yellow)
+                            .padding(.horizontal, 8).padding(.vertical, 6)
+                            .background(Color.black.opacity(0.72))
+                            .overlay(Capsule().stroke(Color.yellow.opacity(0.35), lineWidth: 1))
+                            .clipShape(Capsule())
+
                         Spacer()
+
+                        Button(action: {
+                            showCatalog = false
+                            showInfo = false
+                            sim.isFSSOpen.toggle()
+                        }) {
+                            HStack(spacing: 3) {
+                                Image(systemName: "waveform.path.ecg")
+                                Text("FSS")
+                            }
+                            .font(.system(size: 10, weight: .bold))
+                            .padding(.horizontal, 8).padding(.vertical, 6)
+                            .background(sim.isFSSOpen ? Color.cyan.opacity(0.45) : Color.black.opacity(0.72))
+                            .overlay(Capsule().stroke(Color.cyan.opacity(0.35), lineWidth: 1))
+                            .clipShape(Capsule())
+                        }
 
                         Button(action: { sim.showOrbits.toggle() }) {
                             Text("Орбиты")
@@ -3291,6 +3587,8 @@ struct ContentView: View {
                         }
                     }
                     .foregroundColor(.white)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
                     .padding(.horizontal, 12)
                     .padding(.top, 10)
 
@@ -3348,6 +3646,31 @@ struct ContentView: View {
                         .padding(.horizontal, 12).padding(.vertical, 5)
                         .background(Color.black.opacity(0.72))
                         .overlay(Capsule().stroke(Color.cyan.opacity(0.4), lineWidth: 1))
+                        .clipShape(Capsule())
+                        .padding(.top, 2)
+                    }
+
+                    if let st = sim.nearbyStation, sim.dockedStation == nil {
+                        HStack(spacing: 8) {
+                            Image(systemName: "building.2.crop.circle.fill")
+                                .foregroundColor(.orange)
+                            Text("СТАНЦИЯ: \(st.name) • \(sim.nearbyStationDistText)")
+                                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                .foregroundColor(.white)
+                            Button("СТЫКОВКА") {
+                                showCatalog = false
+                                showInfo = false
+                                sim.dockAtNearbyStation()
+                            }
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundColor(.black)
+                            .padding(.horizontal, 10).padding(.vertical, 4)
+                            .background(Color.orange)
+                            .clipShape(Capsule())
+                        }
+                        .padding(.horizontal, 12).padding(.vertical, 5)
+                        .background(Color.black.opacity(0.76))
+                        .overlay(Capsule().stroke(Color.orange.opacity(0.5), lineWidth: 1))
                         .clipShape(Capsule())
                         .padding(.top, 2)
                     }
@@ -3503,7 +3826,7 @@ struct ContentView: View {
                 }
             }
 
-            if showInfo && !sim.isWalkingOnSurface && !sim.isMainMenu {
+            if showInfo && !sim.isWalkingOnSurface && !sim.isMainMenu && sim.dockedStation == nil {
                 let b = sim.targetBody
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
@@ -3596,13 +3919,17 @@ struct ContentView: View {
                 .cornerRadius(16)
             }
 
-            if showCatalog && !sim.isWalkingOnSurface && !sim.isMainMenu {
-                let filteredBodies = UniverseCatalog.bodies.filter {
-                    selectedCategory == .all || $0.category == selectedCategory
-                }
+            if showCatalog && !sim.isWalkingOnSurface && !sim.isMainMenu && sim.dockedStation == nil {
+                let filteredBodies = (selectedCategory == .stations)
+                    ? []
+                    : UniverseCatalog.bodies.filter { selectedCategory == .all || $0.category == selectedCategory }
+                let filteredStations = (selectedCategory == .all || selectedCategory == .stations)
+                    ? EliteSystemsEngine.stations
+                    : []
+                let totalCount = filteredBodies.count + filteredStations.count
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
-                        Text("Астрономический каталог 1:1 (\(filteredBodies.count))")
+                        Text("Астрономический каталог 1:1 (\(totalCount))")
                             .font(.headline)
                         Spacer()
                         Button("Закрыть") { showCatalog = false }
@@ -3625,6 +3952,37 @@ struct ContentView: View {
 
                     ScrollView {
                         VStack(spacing: 6) {
+                            ForEach(filteredStations) { station in
+                                HStack(spacing: 8) {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(station.name).bold().foregroundColor(.orange)
+                                        Text("Станция • \(station.economy.rawValue)").font(.caption).foregroundColor(.gray)
+                                    }
+                                    Spacer()
+                                    Button("Курс") {
+                                        sim.alignToStation(station)
+                                        showCatalog = false
+                                    }
+                                    .font(.caption.bold())
+                                    .padding(.horizontal, 10).padding(.vertical, 6)
+                                    .background(Color.white.opacity(0.15))
+                                    .cornerRadius(8)
+
+                                    Button("Перелёт") {
+                                        sim.warpToStation(station)
+                                        showCatalog = false
+                                    }
+                                    .font(.caption.bold())
+                                    .padding(.horizontal, 10).padding(.vertical, 6)
+                                    .background(Color.orange)
+                                    .foregroundColor(.black)
+                                    .cornerRadius(8)
+                                }
+                                .padding(8)
+                                .background(Color.white.opacity(0.08))
+                                .cornerRadius(10)
+                            }
+
                             ForEach(filteredBodies) { body in
                                 HStack(spacing: 8) {
                                     VStack(alignment: .leading, spacing: 2) {
@@ -3675,6 +4033,14 @@ struct ContentView: View {
                 .background(Color.black.opacity(0.92))
                 .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.cyan.opacity(0.4), lineWidth: 1))
                 .cornerRadius(16)
+            }
+
+            if sim.dockedStation != nil && !sim.isMainMenu {
+                StationServicesOverlay(sim: sim)
+            }
+
+            if sim.isFSSOpen && !sim.isMainMenu && !sim.isWalkingOnSurface && sim.dockedStation == nil {
+                FSSScannerOverlay(sim: sim)
             }
         }
     }
