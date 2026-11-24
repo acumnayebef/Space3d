@@ -478,7 +478,7 @@ final class SurfaceTerrainEngine {
         whitePixel: UIImage,
         compress: (SIMD3<Double>) -> (pos: SIMD3<Float>, scaleFactor: Double)
     ) -> SCNGeometry {
-        let oceanN = 29
+        let oceanN = 33
         let vCount = oceanN * oceanN
         var posSIMD = [SIMD3<Float>](repeating: .zero, count: vCount)
         var positions = [SCNVector3]()
@@ -525,18 +525,61 @@ final class SurfaceTerrainEngine {
         let oceanMat = SCNMaterial()
         oceanMat.lightingModel = .physicallyBased
         oceanMat.diffuse.contents = whitePixel
-        oceanMat.roughness.contents = 0.14
-        oceanMat.metalness.contents = 0.22
+        oceanMat.roughness.contents = 0.09
+        oceanMat.metalness.contents = 0.12
         oceanMat.writesToDepthBuffer = true
         oceanMat.shaderModifiers = [.surface: """
+        float hash21(vec2 p) {
+            p = fract(p * vec2(123.34, 456.21));
+            p += dot(p, p + 45.32);
+            return fract(p.x * p.y);
+        }
+
+        float noise2D(vec2 p) {
+            vec2 i = floor(p);
+            vec2 f = fract(p);
+            f = f * f * (3.0 - 2.0 * f);
+            float a = hash21(i);
+            float b = hash21(i + vec2(1.0, 0.0));
+            float c = hash21(i + vec2(0.0, 1.0));
+            float d = hash21(i + vec2(1.0, 1.0));
+            return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+        }
+
+        float waterFbm(vec2 p) {
+            float v = 0.0;
+            float a = 0.5;
+            for (int i = 0; i < 3; i++) {
+                v += a * noise2D(p);
+                p = p * 2.08 + vec2(11.3, 17.7);
+                a *= 0.48;
+            }
+            return v;
+        }
+
         #pragma body
         vec2 uv = _surface.diffuseTexcoord;
-        float w1 = sin(uv.x * 48.0 + u_time * 1.4) * cos(uv.y * 42.0 - u_time * 1.1);
-        float w2 = sin((uv.x + uv.y) * 95.0 - u_time * 2.1);
-        float wave = w1 * 0.6 + w2 * 0.4;
-        vec3 dN = vec3(dFdx(wave), dFdy(wave), 0.0);
-        _surface.normal = normalize(_surface.normal - dN * 1.8);
-        _surface.diffuse = vec4(0.015, 0.11, 0.28, 0.96);
+        float pixKm = max(0.0005, length(vec2(dFdx(uv.x), dFdy(uv.x))) + length(vec2(dFdx(uv.y), dFdy(uv.y))));
+
+        float swellFade = 1.0 - smoothstep(0.08, 0.35, pixKm);
+        float waveFade = 1.0 - smoothstep(0.015, 0.07, pixKm);
+        float rippleFade = 1.0 - smoothstep(0.002, 0.012, pixKm);
+
+        float wSwell = waterFbm(uv * 4.5 + vec2(u_time * 0.08, -u_time * 0.05));
+        float wMed = waterFbm(uv * 22.0 + vec2(-u_time * 0.35, u_time * 0.25));
+        float wRipple = noise2D(uv * 110.0 + vec2(u_time * 0.9, u_time * 0.6));
+
+        float waveH = wSwell * 0.55 * swellFade + wMed * 0.32 * waveFade + wRipple * 0.13 * rippleFade;
+        vec3 dN = vec3(dFdx(waveH), dFdy(waveH), 0.0);
+        _surface.normal = normalize(_surface.normal - dN * (3.2 * (swellFade * 0.4 + waveFade * 0.6)));
+
+        float ndotv = clamp(abs(dot(normalize(_surface.normal), normalize(_surface.view))), 0.0, 1.0);
+        float fresnel = pow(clamp(1.0 - ndotv, 0.0001, 1.0), 3.5);
+        vec3 waterCol = mix(vec3(0.008, 0.055, 0.14), vec3(0.26, 0.50, 0.78), fresnel * 0.72);
+        waterCol += vec3(0.18) * rippleFade * smoothstep(0.68, 0.85, wMed);
+
+        _surface.diffuse = vec4(waterCol, 0.96);
+        _surface.roughness = mix(0.08, 0.18, rippleFade * 0.4);
         """]
 
         let geo = SCNGeometry(
@@ -656,6 +699,10 @@ final class SurfaceTerrainEngine {
 
         #pragma body
         vec2 km = _surface.diffuseTexcoord;
+        float pixKm = max(0.0005, length(vec2(dFdx(km.x), dFdy(km.x))) + length(vec2(dFdx(km.y), dFdy(km.y))));
+        float fineFade = 1.0 - smoothstep(0.008, 0.06, pixKm);
+        float medFade = 1.0 - smoothstep(0.06, 0.35, pixKm);
+
         vec3 baseCol = _surface.diffuse.rgb;
         vec3 col = baseCol;
         float rough = 0.90;
@@ -666,8 +713,8 @@ final class SurfaceTerrainEngine {
         if (tMode == 1) {
             float macro = fbm2D(km * 0.18);
             float ridge = ridged2D(km * 0.75);
-            float micro = fbm2D(km * 6.5);
-            float fine = noise2D(km * 35.0);
+            float micro = fbm2D(km * 6.5) * medFade + 0.5 * (1.0 - medFade);
+            float fine = noise2D(km * 35.0) * fineFade + 0.5 * (1.0 - fineFade);
 
             float cliff = smoothstep(0.45, 0.82, ridge);
             col = mix(baseCol * (0.72 + 0.55 * macro), vec3(0.24, 0.22, 0.20), cliff * 0.45);
@@ -676,49 +723,50 @@ final class SurfaceTerrainEngine {
             float cloudSh = smoothstep(0.56, 0.76, fbm2D(km * 0.06 + vec2(u_time * 0.01, 0.0)));
             col *= (1.0 - cloudSh * 0.32);
 
-            microH = ridge * 0.55 + micro * 0.30 + fine * 0.15;
+            microH = ridge * 0.55 + micro * 0.30 * medFade + fine * 0.15 * fineFade;
             bumpStrength = 20.0;
             rough = mix(0.88, 0.74, cliff);
         } else if (tMode == 2) {
             float cr = crater2D(km * 0.35);
             float ridge = ridged2D(km * 0.65);
-            float dunes = sin(km.x * 12.0 + fbm2D(km * 2.0) * 6.0) * 0.5 + 0.5;
-            float micro = fbm2D(km * 9.0);
+            float dunes = (sin(km.x * 12.0 + fbm2D(km * 2.0) * 6.0) * 0.5 + 0.5) * fineFade + 0.5 * (1.0 - fineFade);
+            float micro = fbm2D(km * 9.0) * medFade + 0.5 * (1.0 - medFade);
 
             col = baseCol * (0.74 + 0.42 * micro + 0.18 * dunes);
             col = mix(col, vec3(0.22, 0.09, 0.05), clamp(-cr, 0.0, 0.6) * 0.55);
             col = mix(col, vec3(0.62, 0.34, 0.18), smoothstep(0.08, 0.38, cr) * 0.45);
 
-            microH = cr * 0.40 + ridge * 0.35 + dunes * 0.10 + micro * 0.15;
+            microH = cr * 0.40 + ridge * 0.35 + dunes * 0.10 * fineFade + micro * 0.15 * medFade;
             bumpStrength = 24.0;
             rough = 0.92;
         } else if (tMode == 3) {
             float ridge = ridged2D(km * 0.80);
-            float frac = ridged2D(km * 3.2);
-            float micro = fbm2D(km * 11.0);
+            float frac = ridged2D(km * 3.2) * medFade;
+            float micro = fbm2D(km * 11.0) * medFade + 0.5 * (1.0 - medFade);
 
             col = baseCol * (0.76 + 0.40 * micro);
             col = mix(col, vec3(0.14, 0.08, 0.04), smoothstep(0.55, 0.90, frac) * 0.5);
 
-            microH = ridge * 0.50 + frac * 0.30 + micro * 0.20;
+            microH = ridge * 0.50 + frac * 0.30 + micro * 0.20 * medFade;
             bumpStrength = 22.0;
             rough = 0.86;
         } else {
             float cBig = crater2D(km * 0.12);
-            float cMed = crater2D(km * 0.55);
-            float cSmall = crater2D(km * 2.8);
-            float grit = fbm2D(km * 14.0);
+            float cMed = crater2D(km * 0.55) * medFade;
+            float cSmall = crater2D(km * 2.8) * fineFade;
+            float grit = fbm2D(km * 14.0) * fineFade + 0.5 * (1.0 - fineFade);
 
             float cSum = cBig * 0.55 + cMed * 0.35 + cSmall * 0.20;
             col = baseCol * (0.78 + 0.45 * grit);
             col *= (1.0 - clamp(-cSum, 0.0, 0.65) * 0.55);
             col += vec3(0.12, 0.12, 0.13) * smoothstep(0.05, 0.35, cSum);
 
-            microH = cBig * 0.50 + cMed * 0.30 + cSmall * 0.14 + grit * 0.08;
+            microH = cBig * 0.50 + cMed * 0.30 + cSmall * 0.14 + grit * 0.08 * fineFade;
             bumpStrength = 28.0;
             rough = 0.95;
         }
 
+        bumpStrength *= (0.35 + 0.65 * medFade);
         vec3 dN = vec3(dFdx(microH), dFdy(microH), 0.0);
         _surface.normal = normalize(_surface.normal - dN * bumpStrength);
         _surface.diffuse = vec4(col, 1.0);

@@ -28,6 +28,8 @@ final class SpaceSimulationController: ObservableObject {
     let shipNode = SCNNode()
     let shipVisualNode = SCNNode()
     let thirdPersonMeshNode = SCNNode()
+    let landingGearNode = SCNNode()
+    let parkedShipNode = SCNNode()
     let cockpitMeshNode = SCNNode()
     let cockpitStickPivot = SCNNode()
     let cockpitThrottlePivot = SCNNode()
@@ -88,6 +90,9 @@ final class SpaceSimulationController: ObservableObject {
     @Published var atmosphereZoneText: String = ""
     @Published var reentryHeat: Double = 0.0
     @Published var canLandOnTarget: Bool = true
+    @Published var isWalkingOnSurface: Bool = false
+    @Published var isOverWater: Bool = false
+    @Published var canAutoLand: Bool = false
 
     let speedSteps: [(label: String, mps: Double)] = [
         ("1.5 км/с", 1_500),
@@ -121,13 +126,24 @@ final class SpaceSimulationController: ObservableObject {
     private var frameCounter: Int = 0
 
     private var activeSurfaceBodyId: String?
-    private var lastTerrainAnchorWorld: SIMD3<Double> = .zero
+    private var lastTerrainAnchorLocal: SIMD3<Double> = .zero
+    private var lastTerrainBuildPlanetRot: simd_quatd = simd_quatd(angle: 0, axis: SIMD3<Double>(0, 1, 0))
     private var lastTerrainAltitude: Double = -1
     private var lastTrackedBodyId: String?
     private var lastTrackedBodyPos: SIMD3<Double> = .zero
     private var lastTrackedSpinAngle: Double = 0
     private var currentGroundHeightMeters: Double = 0
     private var landedState: Bool = false
+    private var walkingState: Bool = false
+    private var evaPitch: Double = -0.05
+    private var evaYaw: Double = 0.0
+    private var evaVerticalVel: Double = 0.0
+    private var evaHeightAboveGround: Double = 1.85
+    private var evaWalkPhase: Double = 0.0
+    private var evaRefForwardLocal: SIMD3<Double> = SIMD3<Double>(0, 0, -1)
+    private var parkedShipBodyId: String?
+    private var parkedShipLocalPos: SIMD3<Double> = .zero
+    private var parkedShipLocalOrient: simd_quatd = simd_quatd(angle: 0, axis: SIMD3<Double>(0, 1, 0))
 
     private static let dateFormatter: DateFormatter = {
         let df = DateFormatter()
@@ -207,6 +223,9 @@ final class SpaceSimulationController: ObservableObject {
         shipVisualNode.addChildNode(cockpitMeshNode)
         shipNode.addChildNode(shipVisualNode)
         scene.rootNode.addChildNode(shipNode)
+
+        parkedShipNode.isHidden = true
+        scene.rootNode.addChildNode(parkedShipNode)
 
         shipNode.addChildNode(cameraBoomNode)
         let cam = SCNCamera()
@@ -625,71 +644,264 @@ final class SpaceSimulationController: ObservableObject {
     }
 
     private func buildThirdPersonShip() {
-        let hullMat = SCNMaterial()
-        hullMat.lightingModel = .physicallyBased
-        hullMat.diffuse.contents = UIColor(red: 0.22, green: 0.27, blue: 0.35, alpha: 1.0)
-        hullMat.metalness.contents = 0.78
-        hullMat.roughness.contents = 0.30
+        let hullWhite = SCNMaterial()
+        hullWhite.lightingModel = .physicallyBased
+        hullWhite.diffuse.contents = UIColor(red: 0.84, green: 0.87, blue: 0.91, alpha: 1.0)
+        hullWhite.metalness.contents = 0.55
+        hullWhite.roughness.contents = 0.28
 
-        let accentMat = SCNMaterial()
-        accentMat.lightingModel = .physicallyBased
-        accentMat.diffuse.contents = UIColor(red: 0.92, green: 0.38, blue: 0.12, alpha: 1.0)
+        let darkArmor = SCNMaterial()
+        darkArmor.lightingModel = .physicallyBased
+        darkArmor.diffuse.contents = UIColor(red: 0.14, green: 0.17, blue: 0.22, alpha: 1.0)
+        darkArmor.metalness.contents = 0.82
+        darkArmor.roughness.contents = 0.32
 
-        let hull = SCNBox(width: 2.4, height: 0.65, length: 6.8, chamferRadius: 0.22)
-        hull.materials = [hullMat]
-        thirdPersonMeshNode.addChildNode(SCNNode(geometry: hull))
+        let orangeTrim = SCNMaterial()
+        orangeTrim.lightingModel = .physicallyBased
+        orangeTrim.diffuse.contents = UIColor(red: 0.95, green: 0.42, blue: 0.10, alpha: 1.0)
+        orangeTrim.metalness.contents = 0.15
+        orangeTrim.roughness.contents = 0.35
 
-        let nose = SCNPyramid(width: 2.3, height: 2.6, length: 0.62)
-        nose.materials = [hullMat]
-        let noseNode = SCNNode(geometry: nose)
+        let canopyGlass = SCNMaterial()
+        canopyGlass.lightingModel = .physicallyBased
+        canopyGlass.diffuse.contents = UIColor(red: 0.08, green: 0.45, blue: 0.82, alpha: 0.92)
+        canopyGlass.metalness.contents = 0.95
+        canopyGlass.roughness.contents = 0.06
+
+        let glowCyan = SCNMaterial()
+        glowCyan.lightingModel = .constant
+        glowCyan.diffuse.contents = UIColor(red: 0.12, green: 0.90, blue: 1.0, alpha: 1.0)
+
+        let navRed = SCNMaterial()
+        navRed.lightingModel = .constant
+        navRed.diffuse.contents = UIColor(red: 1.0, green: 0.16, blue: 0.12, alpha: 1.0)
+
+        let navGreen = SCNMaterial()
+        navGreen.lightingModel = .constant
+        navGreen.diffuse.contents = UIColor(red: 0.14, green: 1.0, blue: 0.36, alpha: 1.0)
+
+        // Многослойный фюзеляж
+        let upperHull = SCNBox(width: 2.1, height: 0.48, length: 6.4, chamferRadius: 0.22)
+        upperHull.materials = [hullWhite]
+        let upperHullNode = SCNNode(geometry: upperHull)
+        upperHullNode.position = SCNVector3(0, 0.08, 0.1)
+        thirdPersonMeshNode.addChildNode(upperHullNode)
+
+        let underChassis = SCNBox(width: 1.85, height: 0.34, length: 5.8, chamferRadius: 0.12)
+        underChassis.materials = [darkArmor]
+        let underNode = SCNNode(geometry: underChassis)
+        underNode.position = SCNVector3(0, -0.22, 0.25)
+        thirdPersonMeshNode.addChildNode(underNode)
+
+        let dorsalSpine = SCNBox(width: 0.56, height: 0.24, length: 4.1, chamferRadius: 0.08)
+        dorsalSpine.materials = [darkArmor]
+        let spineNode = SCNNode(geometry: dorsalSpine)
+        spineNode.position = SCNVector3(0, 0.38, 1.15)
+        thirdPersonMeshNode.addChildNode(spineNode)
+
+        let spineAccent = SCNBox(width: 0.22, height: 0.26, length: 2.6, chamferRadius: 0.04)
+        spineAccent.materials = [orangeTrim]
+        let spineAccentNode = SCNNode(geometry: spineAccent)
+        spineAccentNode.position = SCNVector3(0, 0.40, 1.6)
+        thirdPersonMeshNode.addChildNode(spineAccentNode)
+
+        // Носовой обтекатель и сенсорная антенна
+        let noseMain = SCNPyramid(width: 2.05, height: 2.8, length: 0.52)
+        noseMain.materials = [hullWhite]
+        let noseNode = SCNNode(geometry: noseMain)
         noseNode.eulerAngles.x = -.pi / 2
-        noseNode.position = SCNVector3(0, 0, -3.4)
+        noseNode.position = SCNVector3(0, 0.02, -3.1)
         thirdPersonMeshNode.addChildNode(noseNode)
 
-        let wings = SCNBox(width: 7.6, height: 0.14, length: 3.1, chamferRadius: 0.06)
-        wings.materials = [hullMat]
-        let wingsNode = SCNNode(geometry: wings)
-        wingsNode.position = SCNVector3(0, -0.08, 1.2)
-        thirdPersonMeshNode.addChildNode(wingsNode)
+        let noseUnder = SCNPyramid(width: 1.65, height: 2.4, length: 0.28)
+        noseUnder.materials = [darkArmor]
+        let noseUnderNode = SCNNode(geometry: noseUnder)
+        noseUnderNode.eulerAngles.x = -.pi / 2
+        noseUnderNode.position = SCNVector3(0, -0.18, -2.75)
+        thirdPersonMeshNode.addChildNode(noseUnderNode)
 
-        let stripe = SCNBox(width: 7.7, height: 0.16, length: 0.45, chamferRadius: 0.04)
-        stripe.materials = [accentMat]
-        let stripeNode = SCNNode(geometry: stripe)
-        stripeNode.position = SCNVector3(0, -0.08, 2.1)
-        thirdPersonMeshNode.addChildNode(stripeNode)
+        let sensorProbe = SCNCylinder(radius: 0.055, height: 0.95)
+        sensorProbe.materials = [darkArmor]
+        let probeNode = SCNNode(geometry: sensorProbe)
+        probeNode.eulerAngles.x = .pi / 2
+        probeNode.position = SCNVector3(0, -0.02, -4.65)
+        thirdPersonMeshNode.addChildNode(probeNode)
 
-        let canopy = SCNSphere(radius: 0.6)
-        let glassMat = SCNMaterial()
-        glassMat.lightingModel = .physicallyBased
-        glassMat.diffuse.contents = UIColor(red: 0.06, green: 0.55, blue: 0.95, alpha: 0.9)
-        glassMat.metalness.contents = 0.9
-        glassMat.roughness.contents = 0.1
-        canopy.materials = [glassMat]
+        let sensorTip = SCNSphere(radius: 0.075)
+        sensorTip.materials = [glowCyan]
+        let tipNode = SCNNode(geometry: sensorTip)
+        tipNode.position = SCNVector3(0, -0.02, -5.12)
+        thirdPersonMeshNode.addChildNode(tipNode)
+
+        // Фонарь кабины с металлической дугой
+        let canopy = SCNSphere(radius: 0.56)
+        canopy.materials = [canopyGlass]
         let canopyNode = SCNNode(geometry: canopy)
-        canopyNode.scale = SCNVector3(1.05, 0.5, 2.0)
-        canopyNode.position = SCNVector3(0, 0.36, -1.1)
+        canopyNode.scale = SCNVector3(1.02, 0.46, 2.15)
+        canopyNode.position = SCNVector3(0, 0.38, -1.25)
         thirdPersonMeshNode.addChildNode(canopyNode)
 
-        exhaustNodes.removeAll()
-        for xOffset in [-0.85, 0.85] {
-            let nozzle = SCNCylinder(radius: 0.28, height: 0.5)
-            nozzle.materials = [hullMat]
-            let nNode = SCNNode(geometry: nozzle)
-            nNode.eulerAngles.x = .pi / 2
-            nNode.position = SCNVector3(Float(xOffset), 0, 3.45)
-            thirdPersonMeshNode.addChildNode(nNode)
+        let canopyArch = SCNTorus(ringRadius: 0.56, pipeRadius: 0.045)
+        canopyArch.materials = [darkArmor]
+        let archNode = SCNNode(geometry: canopyArch)
+        archNode.scale = SCNVector3(1.03, 0.75, 2.12)
+        archNode.position = SCNVector3(0, 0.36, -1.25)
+        thirdPersonMeshNode.addChildNode(archNode)
 
-            let flame = SCNCone(topRadius: 0.02, bottomRadius: 0.24, height: 2.2)
-            let flameMat = SCNMaterial()
-            flameMat.emission.contents = UIColor(red: 0.25, green: 0.82, blue: 1.0, alpha: 0.95)
-            flameMat.blendMode = .add
-            flame.materials = [flameMat]
-            let fNode = SCNNode(geometry: flame)
-            fNode.eulerAngles.x = .pi / 2
-            fNode.position = SCNVector3(Float(xOffset), 0, 4.6)
-            thirdPersonMeshNode.addChildNode(fNode)
-            exhaustNodes.append(fNode)
+        // Стреловидные дельта-крылья, воздухозаборники, кили и БАНО
+        for side in [-1.0, 1.0] {
+            let s = Float(side)
+
+            let intake = SCNBox(width: 0.42, height: 0.36, length: 2.8, chamferRadius: 0.08)
+            intake.materials = [darkArmor]
+            let intakeNode = SCNNode(geometry: intake)
+            intakeNode.position = SCNVector3(s * 1.18, 0.0, 0.15)
+            thirdPersonMeshNode.addChildNode(intakeNode)
+
+            let intakeLip = SCNBox(width: 0.46, height: 0.40, length: 0.14, chamferRadius: 0.03)
+            intakeLip.materials = [orangeTrim]
+            let lipNode = SCNNode(geometry: intakeLip)
+            lipNode.position = SCNVector3(s * 1.18, 0.0, -1.25)
+            thirdPersonMeshNode.addChildNode(lipNode)
+
+            let radFin = SCNBox(width: 0.55, height: 0.06, length: 1.6, chamferRadius: 0.02)
+            radFin.materials = [darkArmor]
+            let radNode = SCNNode(geometry: radFin)
+            radNode.position = SCNVector3(s * 1.25, 0.34, 1.8)
+            radNode.eulerAngles.z = s * 0.25
+            thirdPersonMeshNode.addChildNode(radNode)
+
+            let wingPanel = SCNBox(width: 3.1, height: 0.12, length: 2.1, chamferRadius: 0.05)
+            wingPanel.materials = [hullWhite]
+            let wingNode = SCNNode(geometry: wingPanel)
+            wingNode.position = SCNVector3(s * 2.25, -0.08, 1.35)
+            wingNode.eulerAngles.y = -s * 0.38
+            thirdPersonMeshNode.addChildNode(wingNode)
+
+            let wingLeading = SCNBox(width: 3.15, height: 0.14, length: 0.24, chamferRadius: 0.04)
+            wingLeading.materials = [darkArmor]
+            let leadNode = SCNNode(geometry: wingLeading)
+            leadNode.position = SCNVector3(s * 2.25, -0.08, 0.38)
+            leadNode.eulerAngles.y = -s * 0.38
+            thirdPersonMeshNode.addChildNode(leadNode)
+
+            let wingStripe = SCNBox(width: 2.75, height: 0.135, length: 0.32, chamferRadius: 0.03)
+            wingStripe.materials = [orangeTrim]
+            let stripeNode = SCNNode(geometry: wingStripe)
+            stripeNode.position = SCNVector3(s * 2.25, -0.08, 1.90)
+            stripeNode.eulerAngles.y = -s * 0.38
+            thirdPersonMeshNode.addChildNode(stripeNode)
+
+            let underPod = SCNCapsule(capRadius: 0.20, height: 1.9)
+            underPod.materials = [darkArmor]
+            let podNode = SCNNode(geometry: underPod)
+            podNode.eulerAngles.x = .pi / 2
+            podNode.position = SCNVector3(s * 2.15, -0.26, 1.4)
+            thirdPersonMeshNode.addChildNode(podNode)
+
+            let tailFin = SCNBox(width: 0.09, height: 1.05, length: 1.45, chamferRadius: 0.03)
+            tailFin.materials = [darkArmor]
+            let finNode = SCNNode(geometry: tailFin)
+            finNode.position = SCNVector3(s * 1.45, 0.46, 2.35)
+            finNode.eulerAngles = SCNVector3(0.24, 0, -s * 0.30)
+            thirdPersonMeshNode.addChildNode(finNode)
+
+            let finTip = SCNBox(width: 0.10, height: 0.22, length: 1.15, chamferRadius: 0.02)
+            finTip.materials = [orangeTrim]
+            let finTipNode = SCNNode(geometry: finTip)
+            finTipNode.position = SCNVector3(0, 0.42, 0.05)
+            finNode.addChildNode(finTipNode)
+
+            let navLed = SCNSphere(radius: 0.08)
+            navLed.materials = [side < 0 ? navRed : navGreen]
+            let navNode = SCNNode(geometry: navLed)
+            navNode.position = SCNVector3(s * 3.72, -0.06, 2.05)
+            thirdPersonMeshNode.addChildNode(navNode)
         }
+
+        // Двойные двигательные гондолы и многослойные плазменные факелы
+        exhaustNodes.removeAll()
+        for xOffset in [-0.78, 0.78] {
+            let x = Float(xOffset)
+            let nacelle = SCNCylinder(radius: 0.34, height: 1.9)
+            nacelle.materials = [darkArmor]
+            let nacNode = SCNNode(geometry: nacelle)
+            nacNode.eulerAngles.x = .pi / 2
+            nacNode.position = SCNVector3(x, 0.02, 2.55)
+            thirdPersonMeshNode.addChildNode(nacNode)
+
+            let cowling = SCNCylinder(radius: 0.36, height: 0.30)
+            cowling.materials = [hullWhite]
+            let cowlNode = SCNNode(geometry: cowling)
+            cowlNode.eulerAngles.x = .pi / 2
+            cowlNode.position = SCNVector3(x, 0.02, 3.25)
+            thirdPersonMeshNode.addChildNode(cowlNode)
+
+            let coreRing = SCNTorus(ringRadius: 0.26, pipeRadius: 0.04)
+            coreRing.materials = [glowCyan]
+            let ringNode = SCNNode(geometry: coreRing)
+            ringNode.eulerAngles.x = .pi / 2
+            ringNode.position = SCNVector3(x, 0.02, 3.52)
+            thirdPersonMeshNode.addChildNode(ringNode)
+
+            let coreFlame = SCNCone(topRadius: 0.01, bottomRadius: 0.16, height: 1.6)
+            let coreMat = SCNMaterial()
+            coreMat.lightingModel = .constant
+            coreMat.diffuse.contents = UIColor(red: 0.75, green: 0.96, blue: 1.0, alpha: 0.95)
+            coreMat.blendMode = .add
+            coreFlame.materials = [coreMat]
+            let cfNode = SCNNode(geometry: coreFlame)
+            cfNode.eulerAngles.x = .pi / 2
+            cfNode.position = SCNVector3(x, 0.02, 4.30)
+            thirdPersonMeshNode.addChildNode(cfNode)
+            exhaustNodes.append(cfNode)
+
+            let outerFlame = SCNCone(topRadius: 0.02, bottomRadius: 0.28, height: 2.5)
+            let outerMat = SCNMaterial()
+            outerMat.lightingModel = .constant
+            outerMat.diffuse.contents = UIColor(red: 0.18, green: 0.72, blue: 1.0, alpha: 0.55)
+            outerMat.blendMode = .add
+            outerFlame.materials = [outerMat]
+            let ofNode = SCNNode(geometry: outerFlame)
+            ofNode.eulerAngles.x = .pi / 2
+            ofNode.position = SCNVector3(x, 0.02, 4.75)
+            thirdPersonMeshNode.addChildNode(ofNode)
+            exhaustNodes.append(ofNode)
+        }
+
+        // Посадочные шасси (3 опоры с широкими лапами до y = -1.35)
+        landingGearNode.childNodes.forEach { $0.removeFromParentNode() }
+        let gearPositions: [SCNVector3] = [
+            SCNVector3(0, -0.35, -2.35),
+            SCNVector3(-1.45, -0.35, 1.35),
+            SCNVector3(1.45, -0.35, 1.35)
+        ]
+        for gp in gearPositions {
+            let gearGroup = SCNNode()
+            gearGroup.position = gp
+
+            let strut = SCNCylinder(radius: 0.075, height: 0.92)
+            strut.materials = [darkArmor]
+            let sNode = SCNNode(geometry: strut)
+            sNode.position = SCNVector3(0, -0.46, 0)
+            gearGroup.addChildNode(sNode)
+
+            let collar = SCNCylinder(radius: 0.105, height: 0.28)
+            collar.materials = [hullWhite]
+            let cNode = SCNNode(geometry: collar)
+            cNode.position = SCNVector3(0, -0.24, 0)
+            gearGroup.addChildNode(cNode)
+
+            let pad = SCNBox(width: 0.56, height: 0.14, length: 0.76, chamferRadius: 0.04)
+            pad.materials = [darkArmor]
+            let pNode = SCNNode(geometry: pad)
+            pNode.position = SCNVector3(0, -0.93, 0)
+            gearGroup.addChildNode(pNode)
+
+            landingGearNode.addChildNode(gearGroup)
+        }
+        landingGearNode.isHidden = true
+        thirdPersonMeshNode.addChildNode(landingGearNode)
     }
 
     private func buildFirstPersonCockpit() {
@@ -989,6 +1201,9 @@ final class SpaceSimulationController: ObservableObject {
     }
 
     func toggleFreeCamera() {
+        if walkingState {
+            boardShip()
+        }
         isFreeCamera.toggle()
         if isFreeCamera {
             autoSpeed = true
@@ -1001,7 +1216,13 @@ final class SpaceSimulationController: ObservableObject {
     }
 
     func updateCameraMode() {
-        if isFreeCamera {
+        if walkingState {
+            thirdPersonMeshNode.isHidden = false
+            cockpitMeshNode.isHidden = true
+            cameraBoomNode.eulerAngles = SCNVector3(0, 0, 0)
+            cameraNode.position = SCNVector3(0, 0, 0)
+            cameraNode.eulerAngles = SCNVector3(0, 0, 0)
+        } else if isFreeCamera {
             thirdPersonMeshNode.isHidden = true
             cockpitMeshNode.isHidden = true
             cameraBoomNode.eulerAngles = SCNVector3(0, 0, 0)
@@ -1133,7 +1354,10 @@ final class SpaceSimulationController: ObservableObject {
     }
 
     func handleCameraOrbitDrag(dx: Double, dy: Double) {
-        if isFreeCamera {
+        if walkingState {
+            evaYaw -= dx * 0.0055
+            evaPitch = max(-1.25, min(1.30, evaPitch - dy * 0.0055))
+        } else if isFreeCamera {
             // В свободной камере SpaceEngine свайп по экрану плавно поворачивает взгляд
             let qYaw = simd_quatd(angle: -dx * 0.0045, axis: SIMD3(0, 1, 0))
             let qPitch = simd_quatd(angle: -dy * 0.0045, axis: SIMD3(1, 0, 0))
@@ -1175,6 +1399,16 @@ final class SpaceSimulationController: ObservableObject {
         return (rawSpin, Float(wrapped), invSpin * invTilt)
     }
 
+    private func planetRot(for body: CelestialBody) -> simd_quatd {
+        let rawSpin = (body.rotationPeriodSeconds != 0)
+            ? ((2.0 * .pi / body.rotationPeriodSeconds) * simulationTimeSeconds)
+            : 0.0
+        let wrapped = rawSpin.truncatingRemainder(dividingBy: 2.0 * .pi)
+        let tiltQuat = simd_quatd(angle: body.axialTiltRad, axis: SIMD3<Double>(0, 0, 1))
+        let spinQuat = simd_quatd(angle: wrapped, axis: SIMD3<Double>(0, 1, 0))
+        return tiltQuat * spinQuat
+    }
+
     func alignToTarget() {
         let targetPos = targetBody.currentPosition(simulationTime: simulationTimeSeconds, allBodies: UniverseCatalog.bodies)
         let dir = safeNormalize(targetPos - shipPositionMeters)
@@ -1194,6 +1428,9 @@ final class SpaceSimulationController: ObservableObject {
     }
 
     func warpToBody(_ body: CelestialBody) {
+        if walkingState {
+            boardShip()
+        }
         targetBody = body
         throttle = 0
         shipVelocityMetersPerSec = .zero
@@ -1224,6 +1461,9 @@ final class SpaceSimulationController: ObservableObject {
 
     func warpToSurfaceApproach(_ body: CelestialBody) {
         guard body.isLandable else { return }
+        if walkingState {
+            boardShip()
+        }
         targetBody = body
         throttle = 0
         shipVelocityMetersPerSec = .zero
@@ -1260,7 +1500,141 @@ final class SpaceSimulationController: ObservableObject {
         updateCameraMode()
     }
 
+    func landAtCurrentSpot() {
+        guard !walkingState, !isFreeCamera else { return }
+        var nearestBody = targetBody
+        var nearestDist = Double.greatestFiniteMagnitude
+        var nearestPos = SIMD3<Double>.zero
+        for body in UniverseCatalog.bodies where body.isLandable {
+            let pos = body.currentPosition(simulationTime: simulationTimeSeconds, allBodies: UniverseCatalog.bodies)
+            let d = simd_length(shipPositionMeters - pos) - body.radiusMeters
+            if d < nearestDist {
+                nearestDist = d
+                nearestBody = body
+                nearestPos = pos
+            }
+        }
+        guard nearestBody.isLandable else { return }
+        let upWorld = safeNormalize(shipPositionMeters - nearestPos, fallback: SIMD3<Double>(0, 1, 0))
+        let (_, _, invRot) = planetSpinAndInvRot(for: nearestBody)
+        let sample = SurfaceTerrainEngine.sampleTerrain(localDir: invRot.act(upWorld), body: nearestBody)
+        let effectiveGround = (nearestBody.id == "earth") ? max(0.0, sample.heightMeters) : sample.heightMeters
+        let radarAlt = max(0.0, nearestDist - effectiveGround)
+        guard !sample.isWater && radarAlt < 1_800.0 else { return }
+
+        shipPositionMeters = nearestPos + upWorld * (nearestBody.radiusMeters + effectiveGround + 1.35)
+        levelToHorizon()
+        throttle = 0
+        shipVelocityMetersPerSec = .zero
+        landedState = true
+        isLanded = true
+        landingGearNode.isHidden = false
+        targetBody = nearestBody
+    }
+
+    func enterWalkingMode() {
+        guard landedState && !walkingState else { return }
+        var nearestBody = targetBody
+        var nearestDist = Double.greatestFiniteMagnitude
+        var nearestPos = SIMD3<Double>.zero
+        for body in UniverseCatalog.bodies where body.isLandable {
+            let pos = body.currentPosition(simulationTime: simulationTimeSeconds, allBodies: UniverseCatalog.bodies)
+            let d = simd_length(shipPositionMeters - pos) - body.radiusMeters
+            if d < nearestDist {
+                nearestDist = d
+                nearestBody = body
+                nearestPos = pos
+            }
+        }
+
+        let (_, _, invRot) = planetSpinAndInvRot(for: nearestBody)
+        let curRot = planetRot(for: nearestBody)
+        parkedShipBodyId = nearestBody.id
+        parkedShipLocalPos = invRot.act(shipPositionMeters - nearestPos)
+        parkedShipLocalOrient = simd_normalize(invRot * shipOrientation)
+
+        thirdPersonMeshNode.removeFromParentNode()
+        parkedShipNode.addChildNode(thirdPersonMeshNode)
+        parkedShipNode.isHidden = false
+        thirdPersonMeshNode.isHidden = false
+        cockpitMeshNode.isHidden = true
+        landingGearNode.isHidden = false
+
+        let upWorld = safeNormalize(shipPositionMeters - nearestPos, fallback: SIMD3<Double>(0, 1, 0))
+        let shipRight = shipOrientation.act(SIMD3<Double>(1, 0, 0))
+        let shipFwd = shipOrientation.act(SIMD3<Double>(0, 0, -1))
+        let tangentRight = safeNormalize(
+            shipRight - upWorld * simd_dot(shipRight, upWorld),
+            fallback: safeNormalize(simd_cross(upWorld, SIMD3<Double>(0, 1, 0)))
+        )
+
+        let playerSpot = shipPositionMeters + tangentRight * 7.0
+        let playerUp = safeNormalize(playerSpot - nearestPos, fallback: upWorld)
+        let sample = SurfaceTerrainEngine.sampleTerrain(localDir: invRot.act(playerUp), body: nearestBody)
+        let gH = (nearestBody.id == "earth") ? max(0.0, sample.heightMeters) : sample.heightMeters
+        shipPositionMeters = nearestPos + playerUp * (nearestBody.radiusMeters + gH + 1.85)
+
+        let lookAtShip = safeNormalize(shipFwd * 0.35 - tangentRight * 0.90)
+        evaRefForwardLocal = invRot.act(lookAtShip)
+        evaYaw = 0.0
+        evaPitch = -0.05
+        evaVerticalVel = 0.0
+        evaHeightAboveGround = 1.85
+        evaWalkPhase = 0.0
+
+        let shipRel = (nearestPos + curRot.act(parkedShipLocalPos)) - shipPositionMeters
+        parkedShipNode.simdPosition = SIMD3<Float>(Float(shipRel.x), Float(shipRel.y), Float(shipRel.z))
+        let shipWorldOrient = simd_normalize(curRot * parkedShipLocalOrient)
+        parkedShipNode.simdOrientation = simd_quatf(
+            ix: Float(shipWorldOrient.imag.x),
+            iy: Float(shipWorldOrient.imag.y),
+            iz: Float(shipWorldOrient.imag.z),
+            r: Float(shipWorldOrient.real)
+        )
+
+        walkingState = true
+        isWalkingOnSurface = true
+        isFreeCamera = false
+        throttle = 0
+        shipVelocityMetersPerSec = .zero
+        angularVelYaw = 0
+        angularVelPitch = 0
+        targetBody = nearestBody
+        updateCameraMode()
+    }
+
+    func boardShip() {
+        guard walkingState else { return }
+        thirdPersonMeshNode.removeFromParentNode()
+        shipVisualNode.addChildNode(thirdPersonMeshNode)
+        parkedShipNode.isHidden = true
+
+        if let pid = parkedShipBodyId, let body = UniverseCatalog.bodies.first(where: { $0.id == pid }) {
+            let bodyPos = body.currentPosition(simulationTime: simulationTimeSeconds, allBodies: UniverseCatalog.bodies)
+            let curRot = planetRot(for: body)
+            shipPositionMeters = bodyPos + curRot.act(parkedShipLocalPos)
+            shipOrientation = simd_normalize(curRot * parkedShipLocalOrient)
+            targetBody = body
+        }
+
+        walkingState = false
+        isWalkingOnSurface = false
+        landedState = true
+        isLanded = true
+        throttle = 0
+        shipVelocityMetersPerSec = .zero
+        updateCameraMode()
+    }
+
+    func evaJump() {
+        guard walkingState, evaHeightAboveGround <= 2.05 else { return }
+        evaVerticalVel = 5.2
+    }
+
     func takeoffFromSurface() {
+        if walkingState {
+            boardShip()
+        }
         var nearestBody = targetBody
         var nearestDist = Double.greatestFiniteMagnitude
         var nearestPos = SIMD3<Double>.zero
@@ -1349,10 +1723,12 @@ final class SpaceSimulationController: ObservableObject {
         }
 
         let (rawSpinNearest, _, invNearestRot) = planetSpinAndInvRot(for: nearestBody)
-        if !nearestBody.isStar && nearestSurfaceDist < 120_000 {
+        if !nearestBody.isStar && nearestSurfaceDist < 240_000 {
             if lastTrackedBodyId == nearestBody.id {
                 let orbitalDelta = nearestBodyPos - lastTrackedBodyPos
-                let lockWeight = landedState ? 1.0 : max(0.0, min(1.0, (120_000.0 - nearestSurfaceDist) / 100_000.0))
+                let lockWeight = (landedState || walkingState || nearestSurfaceDist < 120_000.0)
+                    ? 1.0
+                    : max(0.0, min(1.0, (240_000.0 - nearestSurfaceDist) / 120_000.0))
                 shipPositionMeters += orbitalDelta * lockWeight
 
                 let dSpin = (rawSpinNearest - lastTrackedSpinAngle) * lockWeight
@@ -1362,7 +1738,9 @@ final class SpaceSimulationController: ObservableObject {
                     let spinDeltaQuat = simd_quatd(angle: dSpin, axis: spinAxis)
                     let rel = shipPositionMeters - nearestBodyPos
                     shipPositionMeters = nearestBodyPos + spinDeltaQuat.act(rel)
-                    shipOrientation = simd_normalize(spinDeltaQuat * shipOrientation)
+                    if !walkingState {
+                        shipOrientation = simd_normalize(spinDeltaQuat * shipOrientation)
+                    }
                 }
             }
             lastTrackedBodyId = nearestBody.id
@@ -1372,10 +1750,12 @@ final class SpaceSimulationController: ObservableObject {
             lastTrackedBodyId = nil
         }
 
+        var lastSampleIsWater = false
         var upWorld = safeNormalize(shipPositionMeters - nearestBodyPos, fallback: SIMD3<Double>(0, 1, 0))
         if nearestBody.isLandable && nearestSurfaceDist < 350_000 {
             let localDir = invNearestRot.act(upWorld)
             let sample = SurfaceTerrainEngine.sampleTerrain(localDir: localDir, body: nearestBody)
+            lastSampleIsWater = sample.isWater
             currentGroundHeightMeters = (nearestBody.id == "earth") ? max(0.0, sample.heightMeters) : sample.heightMeters
         } else {
             currentGroundHeightMeters = 0.0
@@ -1390,7 +1770,51 @@ final class SpaceSimulationController: ObservableObject {
         }
         let effectiveMaxSpeed = autoSpeed ? autoMaxSpeedMps : speedSteps[speedIndex].mps
 
-        if landedState {
+        if walkingState {
+            let curPlanetRot = planetRot(for: nearestBody)
+            let refWorld = curPlanetRot.act(evaRefForwardLocal)
+            let refProj = refWorld - upWorld * simd_dot(refWorld, upWorld)
+            let curRefFwd = safeNormalize(refProj, fallback: safeNormalize(simd_cross(upWorld, SIMD3<Double>(1, 0, 0))))
+            let qYaw = simd_quatd(angle: evaYaw, axis: upWorld)
+            let walkFwd = safeNormalize(qYaw.act(curRefFwd))
+            let walkRight = safeNormalize(simd_cross(walkFwd, upWorld), fallback: SIMD3<Double>(1, 0, 0))
+
+            let moveFwd = -Double(stickInput.y)
+            let moveRight = Double(stickInput.x)
+            let horizVel = (walkFwd * moveFwd + walkRight * moveRight) * 7.5
+            shipPositionMeters += horizVel * realDt
+
+            let gSurface = max(0.5, nearestBody.surfaceGravityG * 9.80665)
+            evaVerticalVel -= gSurface * realDt
+            evaHeightAboveGround += evaVerticalVel * realDt
+            if evaHeightAboveGround <= 1.85 {
+                evaHeightAboveGround = 1.85
+                evaVerticalVel = 0.0
+            }
+
+            upWorld = safeNormalize(shipPositionMeters - nearestBodyPos, fallback: SIMD3<Double>(0, 1, 0))
+            let sample = SurfaceTerrainEngine.sampleTerrain(localDir: invNearestRot.act(upWorld), body: nearestBody)
+            lastSampleIsWater = sample.isWater
+            let effectiveGround = (nearestBody.id == "earth") ? max(0.0, sample.heightMeters) : sample.heightMeters
+            currentGroundHeightMeters = effectiveGround
+
+            let horizSpeed = simd_length(horizVel)
+            if horizSpeed > 0.3 && evaHeightAboveGround <= 1.86 {
+                evaWalkPhase += realDt * 9.5
+            } else {
+                evaWalkPhase = 0.0
+            }
+            let bob = (horizSpeed > 0.3 && evaHeightAboveGround <= 1.86) ? (sin(evaWalkPhase) * 0.07) : 0.0
+
+            shipPositionMeters = nearestBodyPos + upWorld * (nearestBody.radiusMeters + effectiveGround + evaHeightAboveGround + bob)
+            shipVelocityMetersPerSec = horizVel + upWorld * evaVerticalVel
+
+            let qPitch = simd_quatd(angle: evaPitch, axis: walkRight)
+            let camFwd = safeNormalize(qPitch.act(walkFwd))
+            let camUp = safeNormalize(qPitch.act(upWorld))
+            shipOrientation = orientationFromForwardUp(forward: camFwd, up: camUp)
+            shipVisualNode.eulerAngles = SCNVector3(0, 0, 0)
+        } else if landedState {
             let wantsTakeoff = throttle > 0.15 || (isFreeCamera && (abs(stickInput.x) > 0.1 || abs(stickInput.y) > 0.1))
             if wantsTakeoff {
                 landedState = false
@@ -1431,7 +1855,7 @@ final class SpaceSimulationController: ObservableObject {
             }
         }
 
-        if !landedState {
+        if !walkingState && !landedState {
             let forwardVec = shipOrientation.act(SIMD3<Double>(0, 0, -1))
             let rightVec = shipOrientation.act(SIMD3<Double>(1, 0, 0))
 
@@ -1500,24 +1924,25 @@ final class SpaceSimulationController: ObservableObject {
         }
 
         let preSpeed = simd_length(shipVelocityMetersPerSec)
-        if !landedState && flightAssist && preAtmoDensity > 0.05 && preSpeed > 12_000.0 && !isFreeCamera {
+        if !walkingState && !landedState && flightAssist && preAtmoDensity > 0.05 && preSpeed > 12_000.0 && !isFreeCamera {
             let drag = min(0.85, preAtmoDensity * realDt * 1.4)
             shipVelocityMetersPerSec *= (1.0 - drag)
         }
 
         let flightDt = (isTimePaused || isFreeCamera) ? realDt : (realDt * max(1.0, abs(warp)))
-        if !landedState {
+        if !walkingState && !landedState {
             shipPositionMeters += shipVelocityMetersPerSec * flightDt
         }
 
-        if nearestBody.isLandable && nearestSurfaceDist < 350_000 {
+        if !walkingState && nearestBody.isLandable && nearestSurfaceDist < 350_000 {
             upWorld = safeNormalize(shipPositionMeters - nearestBodyPos, fallback: SIMD3<Double>(0, 1, 0))
             let localDir = invNearestRot.act(upWorld)
             let sample = SurfaceTerrainEngine.sampleTerrain(localDir: localDir, body: nearestBody)
+            lastSampleIsWater = sample.isWater
             let effectiveGround = (nearestBody.id == "earth") ? max(0.0, sample.heightMeters) : sample.heightMeters
             currentGroundHeightMeters = effectiveGround
 
-            let hoverClearance = isFreeCamera ? 2.0 : 2.8
+            let hoverClearance = isFreeCamera ? 2.0 : 1.35
             let minDistFromCenter = nearestBody.radiusMeters + effectiveGround + hoverClearance
             let currentDist = simd_length(shipPositionMeters - nearestBodyPos)
 
@@ -1534,6 +1959,21 @@ final class SpaceSimulationController: ObservableObject {
             }
         }
 
+        if walkingState, let pid = parkedShipBodyId, let pBody = UniverseCatalog.bodies.first(where: { $0.id == pid }) {
+            let bPos = cachedPositions[pid] ?? pBody.currentPosition(simulationTime: simulationTimeSeconds, allBodies: UniverseCatalog.bodies)
+            let bRot = planetRot(for: pBody)
+            let shipWorldPos = bPos + bRot.act(parkedShipLocalPos)
+            let rel = shipWorldPos - shipPositionMeters
+            parkedShipNode.simdPosition = SIMD3<Float>(Float(rel.x), Float(rel.y), Float(rel.z))
+            let shipWorldOrient = simd_normalize(bRot * parkedShipLocalOrient)
+            parkedShipNode.simdOrientation = simd_quatf(
+                ix: Float(shipWorldOrient.imag.x),
+                iy: Float(shipWorldOrient.imag.y),
+                iz: Float(shipWorldOrient.imag.z),
+                r: Float(shipWorldOrient.real)
+            )
+        }
+
         shipNode.simdOrientation = simd_quatf(
             ix: Float(shipOrientation.imag.x),
             iy: Float(shipOrientation.imag.y),
@@ -1546,6 +1986,8 @@ final class SpaceSimulationController: ObservableObject {
         let radarAlt = max(0.0, updatedSurfaceDist - currentGroundHeightMeters)
         upWorld = safeNormalize(shipPositionMeters - nearestBodyPos, fallback: SIMD3<Double>(0, 1, 0))
 
+        landingGearNode.isHidden = !(nearestBody.isLandable && (radarAlt < 180.0 || landedState || walkingState))
+
         let atmoDensity: Double
         if atmoH > 0 && updatedSurfaceDist < atmoH {
             let hNorm = max(0.0, updatedSurfaceDist / atmoH)
@@ -1553,11 +1995,11 @@ final class SpaceSimulationController: ObservableObject {
         } else {
             atmoDensity = 0.0
         }
-        let heatValue = (atmoDensity > 0.03 && actualSpeed > 2_500.0)
+        let heatValue = (!walkingState && atmoDensity > 0.03 && actualSpeed > 2_500.0)
             ? min(1.0, atmoDensity * ((actualSpeed - 2_500.0) / 8_000.0))
             : 0.0
 
-        if actualSpeed > 1.0 {
+        if actualSpeed > 1.0 && !walkingState {
             let velDir = simd_normalize(shipVelocityMetersPerSec)
             let dustSpeed = Float(min(85.0, log10(actualSpeed + 1.0) * 14.0))
             let move = SIMD3<Float>(Float(-velDir.x), Float(-velDir.y), Float(-velDir.z)) * dustSpeed * Float(realDt)
@@ -1574,7 +2016,7 @@ final class SpaceSimulationController: ObservableObject {
         let flameScale = Float(max(0.05, throttle * (1.0 + Double(speedIndex) * 0.22)))
         for fNode in exhaustNodes {
             fNode.scale = SCNVector3(1.0, flameScale, 1.0)
-            fNode.isHidden = throttle <= 0.01 || isFreeCamera || landedState
+            fNode.isHidden = throttle <= 0.01 || isFreeCamera || landedState || walkingState
         }
 
         let sunDirWorld = safeNormalize(-shipPositionMeters, fallback: SIMD3<Double>(1, 0, 0))
@@ -1586,11 +2028,15 @@ final class SpaceSimulationController: ObservableObject {
 
         let terrainVisible = nearestBody.isLandable && updatedSurfaceDist < 240_000
         if terrainVisible {
-            let movedFromAnchor = simd_length(shipPositionMeters - lastTerrainAnchorWorld)
+            let curPlanetRot = planetRot(for: nearestBody)
+            let currentAnchorWorld = nearestBodyPos + curPlanetRot.act(lastTerrainAnchorLocal)
+            let movedFromAnchor = (lastTerrainAltitude >= 0)
+                ? simd_length(shipPositionMeters - currentAnchorWorld)
+                : Double.greatestFiniteMagnitude
             let needsRebuild = (activeSurfaceBodyId != nearestBody.id)
                 || (lastTerrainAltitude < 0)
-                || (abs(updatedSurfaceDist - lastTerrainAltitude) > max(150.0, lastTerrainAltitude * 0.14))
-                || (movedFromAnchor > max(600.0, updatedSurfaceDist * 0.18))
+                || (abs(updatedSurfaceDist - lastTerrainAltitude) > max(400.0, lastTerrainAltitude * 0.25))
+                || (movedFromAnchor > max(1_200.0, updatedSurfaceDist * 0.25))
 
             if needsRebuild {
                 let res = SurfaceTerrainEngine.buildTerrainGeometry(
@@ -1606,15 +2052,24 @@ final class SpaceSimulationController: ObservableObject {
                 oceanMeshNode.geometry = res.ocean
                 oceanMeshNode.isHidden = (res.ocean == nil)
                 activeSurfaceBodyId = nearestBody.id
-                lastTerrainAnchorWorld = shipPositionMeters
+                lastTerrainAnchorLocal = invNearestRot.act(shipPositionMeters - nearestBodyPos)
+                lastTerrainBuildPlanetRot = curPlanetRot
                 lastTerrainAltitude = updatedSurfaceDist
             }
 
+            let anchorWorldNow = nearestBodyPos + curPlanetRot.act(lastTerrainAnchorLocal)
             terrainRootNode.isHidden = false
             terrainRootNode.simdPosition = SIMD3<Float>(
-                Float(lastTerrainAnchorWorld.x - shipPositionMeters.x),
-                Float(lastTerrainAnchorWorld.y - shipPositionMeters.y),
-                Float(lastTerrainAnchorWorld.z - shipPositionMeters.z)
+                Float(anchorWorldNow.x - shipPositionMeters.x),
+                Float(anchorWorldNow.y - shipPositionMeters.y),
+                Float(anchorWorldNow.z - shipPositionMeters.z)
+            )
+            let deltaRot = simd_normalize(curPlanetRot * simd_inverse(lastTerrainBuildPlanetRot))
+            terrainRootNode.simdOrientation = simd_quatf(
+                ix: Float(deltaRot.imag.x),
+                iy: Float(deltaRot.imag.y),
+                iz: Float(deltaRot.imag.z),
+                r: Float(deltaRot.real)
             )
             terrainRootNode.opacity = CGFloat(max(0.0, min(1.0, (240_000.0 - updatedSurfaceDist) / 100_000.0)))
         } else {
@@ -1740,7 +2195,9 @@ final class SpaceSimulationController: ObservableObject {
 
         let nearSurface = (nearestBody.isLandable && updatedSurfaceDist < 240_000) || (atmoH > 0 && updatedSurfaceDist < atmoH)
         let zoneStr: String
-        if landedState {
+        if walkingState {
+            zoneStr = "ПРОГУЛКА"
+        } else if landedState {
             zoneStr = "ПОСАДКА"
         } else if atmoH > 0 && updatedSurfaceDist < atmoH {
             zoneStr = "АТМОСФЕРА"
@@ -1751,7 +2208,9 @@ final class SpaceSimulationController: ObservableObject {
         }
 
         let altStr: String
-        if landedState {
+        if walkingState {
+            altStr = String(format: "ГРАВ: %.2f g", nearestBody.surfaceGravityG)
+        } else if landedState {
             altStr = "НА ПОВЕРХНОСТИ"
         } else if radarAlt < 1_000 {
             altStr = String(format: "ВЫС: %.0f м", radarAlt)
@@ -1759,8 +2218,11 @@ final class SpaceSimulationController: ObservableObject {
             altStr = String(format: "ВЫС: %.1f км", radarAlt / 1_000.0)
         }
 
+        let currentWalking = walkingState
         let currentLanded = landedState
         let currentCanLand = targetBody.isLandable
+        let currentOverWater = lastSampleIsWater
+        let autoLandReady = !landedState && !walkingState && !isFreeCamera && nearestBody.isLandable && radarAlt < 1_800.0 && !currentOverWater
 
         DispatchQueue.main.async {
             self.distanceText = Self.formatDistance(surfaceDist)
@@ -1770,6 +2232,9 @@ final class SpaceSimulationController: ObservableObject {
             self.simDateText = currentDateStr
             self.screenMarkers = self.showMarkers ? newMarkers : []
             self.isLanded = currentLanded
+            self.isWalkingOnSurface = currentWalking
+            self.isOverWater = currentOverWater
+            self.canAutoLand = autoLandReady
             self.isNearSurface = nearSurface
             self.surfaceAltitudeText = altStr
             self.atmosphereZoneText = zoneStr
@@ -1908,7 +2373,7 @@ struct SceneViewContainer: UIViewRepresentable {
         }
 
         @objc func handlePinch(_ gesture: UIPinchGestureRecognizer) {
-            if sim.isThirdPerson && !sim.isFreeCamera {
+            if sim.isThirdPerson && !sim.isFreeCamera && !sim.isWalkingOnSurface {
                 sim.orbitDistance = max(6.5, min(45.0, sim.orbitDistance / Float(gesture.scale)))
                 sim.updateCameraMode()
                 gesture.scale = 1.0
@@ -2050,7 +2515,7 @@ struct ContentView: View {
                             .clipShape(Capsule())
                     }
 
-                    if !sim.isFreeCamera {
+                    if !sim.isFreeCamera && !sim.isWalkingOnSurface {
                         Button(sim.isThirdPerson ? "1-е лицо" : "3-е лицо") {
                             sim.isThirdPerson.toggle()
                             sim.updateCameraMode()
@@ -2070,13 +2535,40 @@ struct ContentView: View {
                     HStack(spacing: 8) {
                         Text(sim.atmosphereZoneText)
                             .font(.system(size: 10, weight: .bold, design: .monospaced))
-                            .foregroundColor(sim.isLanded ? .green : .orange)
+                            .foregroundColor(sim.isWalkingOnSurface ? .cyan : (sim.isLanded ? .green : .orange))
 
                         Text(sim.surfaceAltitudeText)
                             .font(.system(size: 10, weight: .bold, design: .monospaced))
                             .foregroundColor(.white)
 
-                        if sim.isLanded {
+                        if sim.isWalkingOnSurface {
+                            Button("ПРЫЖОК") {
+                                sim.evaJump()
+                            }
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 9).padding(.vertical, 4)
+                            .background(Color.orange.opacity(0.85))
+                            .clipShape(Capsule())
+
+                            Button("В КОРАБЛЬ") {
+                                sim.boardShip()
+                            }
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 9).padding(.vertical, 4)
+                            .background(Color.green.opacity(0.85))
+                            .clipShape(Capsule())
+                        } else if sim.isLanded {
+                            Button("ВЫЙТИ") {
+                                sim.enterWalkingMode()
+                            }
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 9).padding(.vertical, 4)
+                            .background(Color.cyan.opacity(0.55))
+                            .clipShape(Capsule())
+
                             Button("ВЗЛЁТ") {
                                 sim.takeoffFromSurface()
                             }
@@ -2085,15 +2577,27 @@ struct ContentView: View {
                             .padding(.horizontal, 9).padding(.vertical, 4)
                             .background(Color.green.opacity(0.85))
                             .clipShape(Capsule())
-                        } else if !sim.isFreeCamera {
-                            Button("ГОРИЗОНТ") {
-                                sim.levelToHorizon()
+                        } else {
+                            if sim.canAutoLand {
+                                Button("ПОСАДИТЬ") {
+                                    sim.landAtCurrentSpot()
+                                }
+                                .font(.system(size: 10, weight: .bold))
+                                .foregroundColor(.white)
+                                .padding(.horizontal, 9).padding(.vertical, 4)
+                                .background(Color.green.opacity(0.85))
+                                .clipShape(Capsule())
                             }
-                            .font(.system(size: 10, weight: .bold))
-                            .foregroundColor(.white)
-                            .padding(.horizontal, 9).padding(.vertical, 4)
-                            .background(Color.cyan.opacity(0.45))
-                            .clipShape(Capsule())
+                            if !sim.isFreeCamera {
+                                Button("ГОРИЗОНТ") {
+                                    sim.levelToHorizon()
+                                }
+                                .font(.system(size: 10, weight: .bold))
+                                .foregroundColor(.white)
+                                .padding(.horizontal, 9).padding(.vertical, 4)
+                                .background(Color.cyan.opacity(0.45))
+                                .clipShape(Capsule())
+                            }
                         }
                     }
                     .padding(.horizontal, 12).padding(.vertical, 5)
@@ -2106,34 +2610,36 @@ struct ContentView: View {
                 Spacer()
 
                 HStack(alignment: .bottom, spacing: 10) {
-                    VirtualFlightStick(label: sim.isFreeCamera ? "WASD" : "РУЛЬ") { pt in
+                    VirtualFlightStick(label: sim.isWalkingOnSurface ? "ХОДЬБА" : (sim.isFreeCamera ? "WASD" : "РУЛЬ")) { pt in
                         sim.stickInput = pt
                     }
 
-                    VStack(alignment: .leading, spacing: 5) {
-                        HStack {
-                            Text(sim.isFreeCamera ? "КРУИЗ: \(Int(sim.throttle * 100))%" : "ТЯГА: \(Int(sim.throttle * 100))%")
-                                .font(.system(size: 10, weight: .bold, design: .monospaced))
-                                .foregroundColor(.cyan)
-                            Spacer()
-                            if !sim.isFreeCamera {
-                                Button(sim.flightAssist ? "FA: ON" : "ИНЕРЦИЯ") {
-                                    sim.flightAssist.toggle()
+                    if !sim.isWalkingOnSurface {
+                        VStack(alignment: .leading, spacing: 5) {
+                            HStack {
+                                Text(sim.isFreeCamera ? "КРУИЗ: \(Int(sim.throttle * 100))%" : "ТЯГА: \(Int(sim.throttle * 100))%")
+                                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                    .foregroundColor(.cyan)
+                                Spacer()
+                                if !sim.isFreeCamera {
+                                    Button(sim.flightAssist ? "FA: ON" : "ИНЕРЦИЯ") {
+                                        sim.flightAssist.toggle()
+                                    }
+                                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                                    .padding(.horizontal, 6).padding(.vertical, 2)
+                                    .background(sim.flightAssist ? Color.green.opacity(0.35) : Color.orange.opacity(0.5))
+                                    .cornerRadius(6)
                                 }
-                                .font(.system(size: 9, weight: .bold, design: .monospaced))
-                                .padding(.horizontal, 6).padding(.vertical, 2)
-                                .background(sim.flightAssist ? Color.green.opacity(0.35) : Color.orange.opacity(0.5))
-                                .cornerRadius(6)
                             }
+                            Slider(value: $sim.throttle, in: 0...1)
+                                .frame(width: 140)
+                                .tint(.cyan)
                         }
-                        Slider(value: $sim.throttle, in: 0...1)
-                            .frame(width: 140)
-                            .tint(.cyan)
+                        .padding(8)
+                        .background(Color.black.opacity(0.72))
+                        .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.white.opacity(0.2), lineWidth: 1))
+                        .cornerRadius(14)
                     }
-                    .padding(8)
-                    .background(Color.black.opacity(0.72))
-                    .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.white.opacity(0.2), lineWidth: 1))
-                    .cornerRadius(14)
 
                     Spacer()
 
@@ -2196,6 +2702,8 @@ struct ContentView: View {
                             Button(action: { sim.autoSpeed.toggle() }) {
                                 Text("АВТО")
                                     .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                    .lineLimit(1)
+                                    .fixedSize(horizontal: true, vertical: false)
                                     .padding(.horizontal, 8).padding(.vertical, 6)
                                     .background(sim.autoSpeed ? Color.cyan.opacity(0.45) : Color.white.opacity(0.14))
                                     .clipShape(Capsule())
@@ -2214,6 +2722,8 @@ struct ContentView: View {
                             Text(sim.autoSpeed ? sim.autoSpeedLabel : sim.speedSteps[sim.speedIndex].label)
                                 .font(.system(size: 11, weight: .bold, design: .monospaced))
                                 .foregroundColor(sim.autoSpeed ? .cyan : .white)
+                                .lineLimit(1)
+                                .fixedSize(horizontal: true, vertical: false)
                                 .frame(minWidth: 84)
 
                             if !sim.autoSpeed {
@@ -2231,6 +2741,8 @@ struct ContentView: View {
                                 sim.shipVelocityMetersPerSec = .zero
                             }
                             .font(.system(size: 10, weight: .bold))
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
                             .padding(.horizontal, 10).padding(.vertical, 6)
                             .background(Color.red.opacity(0.82))
                             .clipShape(Capsule())
