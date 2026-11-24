@@ -32,12 +32,10 @@ final class SpaceSimulationController: ObservableObject {
     var shipVelocityMetersPerSec = SIMD3<Double>(0, 0, 0)
     var shipOrientation = simd_quatd(angle: 0.68, axis: simd_normalize(SIMD3<Double>(-0.18, 1.0, 0.0)))
 
-    // Угловая скорость для плавного управления джойстиком
     var angularVelYaw: Double = 0
     var angularVelPitch: Double = 0
-    var stickInput: CGPoint = .zero // x: -1...1 (yaw), y: -1...1 (pitch)
+    var stickInput: CGPoint = .zero
 
-    // Свободный облёт камеры (свайп по экрану) + пружинное отставание
     var orbitYaw: Float = 0.0
     var orbitPitch: Float = -0.16
     var orbitDistance: Float = 13.5
@@ -82,6 +80,13 @@ final class SpaceSimulationController: ObservableObject {
     private var planetMaterials: [String: SCNMaterial] = [:]
     private var atmoMaterials: [String: SCNMaterial] = [:]
     private var lastUpdateTime: TimeInterval = 0
+    private lazy var whitePixel: UIImage = {
+        let r = UIGraphicsImageRenderer(size: CGSize(width: 2, height: 2))
+        return r.image { ctx in
+            ctx.cgContext.setFillColor(UIColor.white.cgColor)
+            ctx.cgContext.fill(CGRect(x: 0, y: 0, width: 2, height: 2))
+        }
+    }()
 
     init() {
         setupScene()
@@ -92,14 +97,14 @@ final class SpaceSimulationController: ObservableObject {
 
         let sunLight = SCNLight()
         sunLight.type = .directional
-        sunLight.intensity = 1700
+        sunLight.intensity = 1750
         sunLight.color = UIColor(red: 1.0, green: 0.98, blue: 0.95, alpha: 1.0)
         sunLightNode.light = sunLight
         scene.rootNode.addChildNode(sunLightNode)
 
         let ambient = SCNLight()
         ambient.type = .ambient
-        ambient.intensity = 18
+        ambient.intensity = 16
         ambient.color = UIColor(red: 0.12, green: 0.18, blue: 0.30, alpha: 1.0)
         let ambientNode = SCNNode()
         ambientNode.light = ambient
@@ -157,65 +162,148 @@ final class SpaceSimulationController: ObservableObject {
             sphere.segmentCount = 144
 
             let mat = SCNMaterial()
-            if body.isStar {
+            // Обязательно привязываем 2x2 текстуру, чтобы SceneKit передавал _surface.diffuseTexcoord в шейдер!
+            mat.diffuse.contents = whitePixel
+
+            if body.id == "sgr_a" {
+                // Горизонт событий чёрной дыры + тонкое фотонное кольцо
+                mat.lightingModel = .constant
+                mat.diffuse.contents = UIColor.black
+                mat.shaderModifiers = [.fragment: """
+                    float ndotv = clamp(abs(dot(normalize(_surface.normal), normalize(_surface.view))), 0.0, 1.0);
+                    float photonRing = pow(1.0 - ndotv, 10.0) * 2.8;
+                    _output.color = vec4(vec3(1.0, 0.72, 0.35) * photonRing, 1.0);
+                """]
+            } else if body.isStar {
                 mat.lightingModel = .constant
                 mat.emission.contents = uiColor(from: body.colorHex)
-                mat.shaderModifiers = [.surface: starShaderModifier()]
+                mat.shaderModifiers = [.surface: starShaderModifier(for: body)]
+
+                // Мягкая корона звезды
+                let corona = SCNSphere(radius: 1.24)
+                corona.segmentCount = 64
+                let cMat = SCNMaterial()
+                cMat.lightingModel = .constant
+                cMat.blendMode = .add
+                cMat.cullMode = .front
+                cMat.writesToDepthBuffer = false
+                let c = rgbComponents(body.colorHex)
+                cMat.shaderModifiers = [.fragment: """
+                    float ndotv = clamp(abs(dot(normalize(_surface.normal), normalize(_surface.view))), 0.0, 1.0);
+                    float glow = pow(ndotv, 3.6) * 0.95;
+                    _output.color = vec4(vec3(\(c.r), \(c.g), \(c.b)) * glow, glow);
+                """]
+                corona.materials = [cMat]
+                root.addChildNode(SCNNode(geometry: corona))
             } else {
                 mat.lightingModel = .physicallyBased
-                mat.roughness.contents = body.id == "earth" ? 0.40 : 0.88
+                mat.roughness.contents = body.id == "earth" ? 0.42 : 0.88
                 mat.metalness.contents = 0.02
                 mat.shaderModifiers = [.surface: planetShaderModifier(for: body)]
-                mat.setValue(NSValue(scnVector3: SCNVector3(1, 0, 0)), forKey: "sunDir")
+                mat.setValue(NSValue(scnVector3: SCNVector3(1, 0, 0)), forKey: "sunDirLocal")
                 planetMaterials[body.id] = mat
             }
+
             sphere.materials = [mat]
             let meshNode = SCNNode(geometry: sphere)
             root.addChildNode(meshNode)
             planetMeshNodes[body.id] = meshNode
 
-            // Физически корректная атмосфера: яркая на дневной стороне, закатный оттенок на терминаторе, чёрная ночью
+            // Фотореалистичная атмосфера (мягкое рэлеевское рассеяние + оранжевый закат на терминаторе, ночь тёмная)
             if body.hasAtmosphere && !body.isStar {
-                let atmoSphere = SCNSphere(radius: 1.042)
+                let atmoSphere = SCNSphere(radius: 1.055)
                 atmoSphere.segmentCount = 96
                 let atmoMat = SCNMaterial()
                 atmoMat.lightingModel = .constant
                 atmoMat.blendMode = .add
                 atmoMat.cullMode = .front
                 atmoMat.writesToDepthBuffer = false
-                let dayCol = body.id == "mars" ? "vec3(0.95, 0.48, 0.25)" : "vec3(0.24, 0.58, 1.0)"
-                let sunsetCol = body.id == "mars" ? "vec3(0.85, 0.28, 0.12)" : "vec3(1.0, 0.45, 0.16)"
+
+                let dayCol: String
+                let sunsetCol: String
+                switch body.id {
+                case "mars":
+                    dayCol = "vec3(0.92, 0.48, 0.26)"
+                    sunsetCol = "vec3(0.80, 0.25, 0.10)"
+                case "venus":
+                    dayCol = "vec3(0.95, 0.78, 0.48)"
+                    sunsetCol = "vec3(0.90, 0.45, 0.18)"
+                case "neptune", "uranus":
+                    dayCol = "vec3(0.28, 0.72, 1.0)"
+                    sunsetCol = "vec3(0.18, 0.45, 0.95)"
+                default:
+                    dayCol = "vec3(0.22, 0.58, 1.0)"
+                    sunsetCol = "vec3(1.0, 0.44, 0.14)"
+                }
+
                 atmoMat.shaderModifiers = [.fragment: """
-                    #pragma arguments
-                    vec3 sunDir;
+                    uniform vec3 sunDirView;
                     #pragma body
-                    vec3 n = normalize(_surface.normal);
+                    vec3 n = normalize(-_surface.normal);
                     vec3 v = normalize(_surface.view);
-                    float ndotv = clamp(abs(dot(n, v)), 0.0, 1.0);
-                    float rim = pow(ndotv, 2.8) * smoothstep(0.0, 0.42, 1.0 - ndotv);
-                    float sunDot = dot(n, normalize(sunDir));
-                    float dayMask = smoothstep(-0.22, 0.35, sunDot);
-                    float sunsetMask = exp(-pow((sunDot + 0.02) * 4.5, 2.0));
-                    vec3 col = mix(\(dayCol), \(sunsetCol), sunsetMask * 0.65);
-                    _output.color = vec4(col * rim * dayMask * 1.65, rim * dayMask);
+                    float ndotv = clamp(dot(n, v), 0.0, 1.0);
+                    float halo = pow(ndotv, 3.2) * smoothstep(0.0, 0.35, 1.0 - ndotv);
+                    float sunDot = dot(n, normalize(sunDirView));
+                    float dayMask = smoothstep(-0.25, 0.32, sunDot);
+                    float sunset = exp(-pow((sunDot + 0.04) * 4.5, 2.0));
+                    vec3 col = mix(\(dayCol), \(sunsetCol), sunset * 0.65);
+                    _output.color = vec4(col * halo * dayMask * 2.2, halo * dayMask);
                 """]
-                atmoMat.setValue(NSValue(scnVector3: SCNVector3(1, 0, 0)), forKey: "sunDir")
+                atmoMat.setValue(NSValue(scnVector3: SCNVector3(1, 0, 0)), forKey: "sunDirView")
                 atmoMaterials[body.id] = atmoMat
                 atmoSphere.materials = [atmoMat]
                 root.addChildNode(SCNNode(geometry: atmoSphere))
             }
 
+            // Попиксельный шейдерный диск колец (Сатурн / Уран / аккреционный диск Стрельца A*)
             if body.hasRings {
-                let ring = SCNTube(innerRadius: 1.32, outerRadius: 2.38, height: 0.002)
+                let isBH = (body.id == "sgr_a")
+                let planeSize: CGFloat = isBH ? 8.0 : 5.2
+                let ringPlane = SCNPlane(width: planeSize, height: planeSize)
                 let ringMat = SCNMaterial()
-                ringMat.diffuse.contents = generateRingTexture(isBlackHole: body.id == "sgr_a")
-                if body.id == "sgr_a" {
-                    ringMat.emission.contents = ringMat.diffuse.contents
-                }
+                ringMat.lightingModel = .constant
+                ringMat.diffuse.contents = whitePixel
                 ringMat.isDoubleSided = true
-                ring.materials = [ringMat]
-                let ringNode = SCNNode(geometry: ring)
-                ringNode.eulerAngles = SCNVector3(0.12, 0.0, 0.08)
+                ringMat.writesToDepthBuffer = false
+                ringMat.blendMode = isBH ? .add : .alpha
+
+                if isBH {
+                    ringMat.shaderModifiers = [.fragment: """
+                        vec2 uv = (_surface.diffuseTexcoord - vec2(0.5, 0.5)) * 2.0;
+                        float r = length(uv);
+                        if (r < 0.26 || r > 1.0) { discard_fragment(); }
+                        float angle = atan(uv.y, uv.x);
+                        float swirl = sin(r * 42.0 - angle * 3.0 + u_time * 1.6) * 0.5 + 0.5;
+                        float swirl2 = sin(r * 85.0 + angle * 5.0 - u_time * 2.4) * 0.5 + 0.5;
+                        float density = smoothstep(0.26, 0.34, r) * smoothstep(1.0, 0.32, r);
+                        float heat = pow(1.0 - (r - 0.26) / 0.74, 1.8);
+                        vec3 innerCol = vec3(1.0, 0.92, 0.72);
+                        vec3 outerCol = vec3(0.95, 0.35, 0.05);
+                        vec3 col = mix(outerCol, innerCol, heat) * (0.65 + 0.35 * swirl * swirl2);
+                        float alpha = clamp(density * (0.7 + 0.4 * swirl), 0.0, 1.0);
+                        _output.color = vec4(col * 1.4, alpha);
+                    """]
+                } else {
+                    ringMat.shaderModifiers = [.fragment: """
+                        vec2 uv = (_surface.diffuseTexcoord - vec2(0.5, 0.5)) * 2.0;
+                        float r = length(uv);
+                        if (r < 0.48 || r > 0.98) { discard_fragment(); }
+                        // Щель Кассини и микрокольца
+                        float cassini = 1.0 - smoothstep(0.018, 0.0, abs(r - 0.775));
+                        float encke = 1.0 - smoothstep(0.005, 0.0, abs(r - 0.91));
+                        float bands = sin(r * 190.0) * 0.25 + sin(r * 430.0) * 0.15 + 0.65;
+                        float fade = smoothstep(0.48, 0.53, r) * smoothstep(0.98, 0.93, r);
+                        vec3 c1 = vec3(0.86, 0.78, 0.62);
+                        vec3 c2 = vec3(0.62, 0.54, 0.42);
+                        vec3 col = mix(c2, c1, clamp(bands, 0.0, 1.0));
+                        float alpha = clamp(fade * bands * cassini * encke * 0.85, 0.0, 0.92);
+                        _output.color = vec4(col, alpha);
+                    """]
+                }
+
+                ringPlane.materials = [ringMat]
+                let ringNode = SCNNode(geometry: ringPlane)
+                ringNode.eulerAngles = SCNVector3(-Float.pi / 2.0 + (isBH ? 0.22 : 0.0), 0.0, 0.0)
                 root.addChildNode(ringNode)
             }
 
@@ -224,7 +312,7 @@ final class SpaceSimulationController: ObservableObject {
         }
     }
 
-    // Реалистичный 3D-шейдер планет с настоящим градиентным FBM-шумом, искривлением облаков и ночными огнями только на тёмной стороне
+    // 100% валидный GLSL-шейдер SceneKit с истинными 3D-координатами сферы, рельефом нормалей, облаками и ночными огнями
     private func planetShaderModifier(for body: CelestialBody) -> String {
         let mode: Int
         switch body.id {
@@ -238,111 +326,146 @@ final class SpaceSimulationController: ObservableObject {
         let c2 = rgbComponents(body.secondaryHex)
 
         return """
-        #pragma arguments
-        vec3 sunDir;
-        #pragma body
-        vec3 pos = normalize(_surface.position);
+        uniform vec3 sunDirLocal;
 
-        // Настоящий 3D Value Noise + 6-октавный FBM
-        vec3 p = pos * 3.8;
-        float n = 0.0;
-        float ridge = 0.0;
-        float amp = 0.5;
-        vec3 q = p;
-        for (int i = 0; i < 6; i++) {
-            vec3 fl = floor(q);
-            vec3 fr = fract(q);
-            fr = fr * fr * (3.0 - 2.0 * fr);
-            float n000 = fract(sin(dot(fl + vec3(0,0,0), vec3(127.1, 311.7, 74.7))) * 43758.5453);
-            float n100 = fract(sin(dot(fl + vec3(1,0,0), vec3(127.1, 311.7, 74.7))) * 43758.5453);
-            float n010 = fract(sin(dot(fl + vec3(0,1,0), vec3(127.1, 311.7, 74.7))) * 43758.5453);
-            float n110 = fract(sin(dot(fl + vec3(1,1,0), vec3(127.1, 311.7, 74.7))) * 43758.5453);
-            float n001 = fract(sin(dot(fl + vec3(0,0,1), vec3(127.1, 311.7, 74.7))) * 43758.5453);
-            float n101 = fract(sin(dot(fl + vec3(1,0,1), vec3(127.1, 311.7, 74.7))) * 43758.5453);
-            float n011 = fract(sin(dot(fl + vec3(0,1,1), vec3(127.1, 311.7, 74.7))) * 43758.5453);
-            float n111 = fract(sin(dot(fl + vec3(1,1,1), vec3(127.1, 311.7, 74.7))) * 43758.5453);
-            float nx00 = mix(n000, n100, fr.x);
-            float nx10 = mix(n010, n110, fr.x);
-            float nx01 = mix(n001, n101, fr.x);
-            float nx11 = mix(n011, n111, fr.x);
-            float v = mix(mix(nx00, nx10, fr.y), mix(nx01, nx11, fr.y), fr.z);
-            n += v * amp;
-            ridge += (1.0 - abs(v * 2.0 - 1.0)) * amp;
-            q = q * 2.08 + vec3(13.4, 7.1, 19.3);
-            amp *= 0.48;
+        float hash31(vec3 p) {
+            p = fract(p * 0.3183099 + vec3(0.1, 0.2, 0.3));
+            p *= 17.0;
+            return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
         }
+
+        float noise3D(vec3 x) {
+            vec3 i = floor(x);
+            vec3 f = fract(x);
+            f = f * f * (3.0 - 2.0 * f);
+            float n000 = hash31(i + vec3(0.0, 0.0, 0.0));
+            float n100 = hash31(i + vec3(1.0, 0.0, 0.0));
+            float n010 = hash31(i + vec3(0.0, 1.0, 0.0));
+            float n110 = hash31(i + vec3(1.0, 1.0, 0.0));
+            float n001 = hash31(i + vec3(0.0, 0.0, 1.0));
+            float n101 = hash31(i + vec3(1.0, 0.0, 1.0));
+            float n011 = hash31(i + vec3(0.0, 1.0, 1.0));
+            float n111 = hash31(i + vec3(1.0, 1.0, 1.0));
+            float nx00 = mix(n000, n100, f.x);
+            float nx10 = mix(n010, n110, f.x);
+            float nx01 = mix(n001, n101, f.x);
+            float nx11 = mix(n011, n111, f.x);
+            return mix(mix(nx00, nx10, f.y), mix(nx01, nx11, f.y), f.z);
+        }
+
+        float fbm(vec3 p) {
+            float v = 0.0;
+            float a = 0.5;
+            for (int i = 0; i < 6; i++) {
+                v += a * noise3D(p);
+                p = p * 2.07 + vec3(13.1, 7.4, 19.7);
+                a *= 0.49;
+            }
+            return v;
+        }
+
+        #pragma body
+        float phi = _surface.diffuseTexcoord.x * 6.2831853;
+        float theta = _surface.diffuseTexcoord.y * 3.14159265;
+        vec3 pos = vec3(sin(theta) * cos(phi), cos(theta), sin(theta) * sin(phi));
+
+        float n = fbm(pos * 3.6);
+        float detail = fbm(pos * 14.0);
+        float ridge = 1.0 - abs(detail * 2.0 - 1.0);
 
         vec3 col1 = vec3(\(c1.r), \(c1.g), \(c1.b));
         vec3 col2 = vec3(\(c2.r), \(c2.g), \(c2.b));
         vec3 albedo = col1;
-        vec3 emissive = vec3(0.0);
+        vec3 emissive = vec3(0.0, 0.0, 0.0);
         float rough = 0.86;
-        float sunDot = dot(pos, normalize(sunDir));
-        float nightMask = smoothstep(0.08, -0.18, sunDot);
+        float bumpStrength = 0.0;
+
+        float sunDot = dot(pos, normalize(sunDirLocal));
+        float nightMask = smoothstep(0.06, -0.18, sunDot);
 
         int planetMode = \(mode);
         if (planetMode == 1) {
+            // Земля: океаны с шельфом, континенты с биомами, хребты гор, полярные шапки
             float lat = abs(pos.y);
-            if (lat + n * 0.16 > 0.86) {
+            float warp = fbm(pos * 2.2 + vec3(4.1, 1.7, 8.3)) * 0.25;
+            float elev = n + warp - 0.12;
+
+            if (lat + detail * 0.14 > 0.87) {
                 albedo = vec3(0.95, 0.97, 1.0);
                 rough = 0.55;
-            } else if (n < 0.495) {
-                float depth = clamp(n / 0.495, 0.0, 1.0);
-                albedo = mix(vec3(0.01, 0.05, 0.22), vec3(0.04, 0.28, 0.58), pow(depth, 1.8));
-                rough = 0.12;
+            } else if (elev < 0.50) {
+                float depth = clamp(elev / 0.50, 0.0, 1.0);
+                albedo = mix(vec3(0.008, 0.04, 0.18), vec3(0.03, 0.26, 0.56), pow(depth, 2.2));
+                rough = 0.14;
             } else {
-                float h = (n - 0.495) / 0.505;
-                vec3 forest = vec3(0.09, 0.28, 0.11);
-                vec3 desert = vec3(0.62, 0.53, 0.34);
-                vec3 rock = vec3(0.36, 0.34, 0.32);
+                float h = clamp((elev - 0.50) / 0.42, 0.0, 1.0);
+                vec3 forest = vec3(0.07, 0.24, 0.09);
+                vec3 savanna = vec3(0.32, 0.36, 0.16);
+                vec3 desert = vec3(0.64, 0.53, 0.35);
+                vec3 rock = vec3(0.35, 0.33, 0.31);
                 vec3 snow = vec3(0.94, 0.96, 0.98);
-                float aridity = smoothstep(0.05, 0.38, abs(lat - 0.28));
-                vec3 lowLand = mix(desert, forest, aridity);
-                albedo = mix(lowLand, rock, smoothstep(0.35, 0.70, h + ridge * 0.12));
-                albedo = mix(albedo, snow, smoothstep(0.75, 0.92, h + ridge * 0.18));
-                rough = 0.92;
 
-                // Ночные огни городов ТОЛЬКО на ночной стороне Земли
-                if (h < 0.22 && lat < 0.65 && nightMask > 0.01) {
-                    float cHash = fract(sin(dot(floor(pos * 220.0), vec3(12.9898, 78.233, 37.719))) * 43758.5453);
-                    if (cHash > 0.88) {
-                        emissive = vec3(1.0, 0.72, 0.30) * (cHash - 0.88) * 9.0 * nightMask;
+                float arid = smoothstep(0.08, 0.32, abs(lat - 0.27)) * smoothstep(0.2, 0.8, detail);
+                vec3 lowCol = mix(desert, mix(savanna, forest, detail), arid);
+                albedo = mix(lowCol, rock, smoothstep(0.32, 0.68, h + ridge * 0.18));
+                albedo = mix(albedo, snow, smoothstep(0.76, 0.94, h + ridge * 0.22));
+                rough = 0.92;
+                bumpStrength = 10.0;
+
+                // Ночные огни мегаполисов ТОЛЬКО на тёмной стороне Земли
+                if (h < 0.28 && lat < 0.68 && nightMask > 0.01) {
+                    float cityCluster = fbm(pos * 24.0);
+                    float lights = hash31(floor(pos * 260.0));
+                    if (cityCluster > 0.54 && lights > 0.84) {
+                        emissive = vec3(1.0, 0.74, 0.32) * (lights - 0.84) * 14.0 * nightMask;
                     }
                 }
             }
 
-            // Вихревые облака (domain-warped FBM)
-            vec3 cp = pos * 4.8 + vec3(n * 0.85 + u_time * 0.005, n * 0.45, -n * 0.65);
-            float cn = 0.0;
-            float camp = 0.52;
-            for (int j = 0; j < 4; j++) {
-                vec3 fl = floor(cp);
-                vec3 fr = fract(cp);
-                fr = fr * fr * (3.0 - 2.0 * fr);
-                float a = fract(sin(dot(fl, vec3(127.1, 311.7, 74.7))) * 43758.5453);
-                float b = fract(sin(dot(fl + vec3(1,1,1), vec3(127.1, 311.7, 74.7))) * 43758.5453);
-                cn += mix(a, b, (fr.x + fr.y + fr.z) * 0.333) * camp;
-                cp = cp * 2.15 + vec3(5.2, 1.3, 8.7);
-                camp *= 0.48;
-            }
-            float clouds = smoothstep(0.50, 0.76, cn);
-            albedo = mix(albedo, vec3(0.98, 0.99, 1.0), clouds * 0.88);
+            // Вихревые облака с тенью на поверхности
+            vec3 cWarp = vec3(sin(pos.y * 5.0) * 0.45 + u_time * 0.004, cos(pos.x * 5.0) * 0.25, 0.0);
+            float cn = fbm(pos * 4.6 + cWarp + vec3(n * 0.9, -n * 0.5, n * 0.7));
+            float cnShadow = fbm((pos + normalize(sunDirLocal) * 0.012) * 4.6 + cWarp + vec3(n * 0.9, -n * 0.5, n * 0.7));
+            float clouds = smoothstep(0.51, 0.76, cn);
+            float cShadow = smoothstep(0.51, 0.76, cnShadow) * (1.0 - clouds) * 0.45;
+            albedo *= (1.0 - cShadow);
+            albedo = mix(albedo, vec3(0.97, 0.98, 1.0), clouds * 0.92);
             emissive *= (1.0 - clouds * 0.85);
             rough = mix(rough, 0.94, clouds);
         } else if (planetMode == 2) {
+            // Марс: ржавые плато, каньоны и полярные шапки
             float lat = abs(pos.y);
-            albedo = mix(col2, col1, smoothstep(0.25, 0.75, n));
+            albedo = mix(col2, col1, smoothstep(0.24, 0.74, n));
             albedo = mix(albedo, vec3(0.84, 0.48, 0.28), ridge * 0.25);
-            if (lat + n * 0.1 > 0.88) albedo = vec3(0.95, 0.94, 0.92);
+            if (lat + detail * 0.12 > 0.88) albedo = vec3(0.95, 0.94, 0.92);
+            bumpStrength = 14.0;
         } else if (planetMode == 3) {
-            float turb = (n - 0.5) * 0.22;
-            float yBand = (pos.y + turb) * 18.0;
+            // Газовые гиганты: турбулентные широтные течения
+            float turb = (n - 0.5) * 0.20 + (detail - 0.5) * 0.07;
+            float yBand = (pos.y + turb) * 19.0;
             float stripe = sin(yBand) * 0.5 + 0.5;
             albedo = mix(col2, col1, smoothstep(0.15, 0.85, stripe));
+            albedo *= (0.88 + detail * 0.24);
             rough = 0.62;
         } else {
+            // Луна / Меркурий: кратеры и каменистый рельеф
+            float crater = smoothstep(0.32, 0.68, detail);
             albedo = mix(col2, col1, smoothstep(0.22, 0.78, n));
-            albedo *= (0.72 + ridge * 0.48);
+            albedo *= (0.68 + ridge * 0.35 + crater * 0.22);
+            bumpStrength = 18.0;
+        }
+
+        // Лёгкая атмосферная дымка по краю диска на дневной стороне
+        if (planetMode == 1 || planetMode == 2) {
+            float ndotv = clamp(abs(dot(normalize(_surface.normal), normalize(_surface.view))), 0.0, 1.0);
+            float fresnel = pow(1.0 - ndotv, 3.2) * smoothstep(-0.15, 0.35, sunDot);
+            vec3 hazeCol = (planetMode == 1) ? vec3(0.28, 0.62, 1.0) : vec3(0.92, 0.48, 0.25);
+            emissive += hazeCol * fresnel * 0.48;
+        }
+
+        if (bumpStrength > 0.1) {
+            vec3 dN = vec3(dFdx(detail), dFdy(detail), 0.0);
+            _surface.normal = normalize(_surface.normal - dN * bumpStrength);
         }
 
         _surface.diffuse = vec4(albedo, 1.0);
@@ -351,13 +474,44 @@ final class SpaceSimulationController: ObservableObject {
         """
     }
 
-    private func starShaderModifier() -> String {
+    private func starShaderModifier(for body: CelestialBody) -> String {
+        let c1 = rgbComponents(body.colorHex)
+        let c2 = rgbComponents(body.secondaryHex)
         return """
-        vec3 p = normalize(_surface.position) * 9.0 + vec3(u_time * 0.12);
-        float gran = sin(p.x * 3.1 + cos(p.y * 3.3 + p.z * 3.5)) * 0.5 + 0.5;
-        float ndotv = abs(dot(normalize(_surface.normal), normalize(_surface.view)));
-        float limb = 0.52 + 0.48 * pow(ndotv, 0.55);
-        _surface.emission.rgb *= (0.80 + gran * 0.38) * limb;
+        float hash31(vec3 p) {
+            p = fract(p * 0.3183099 + vec3(0.1, 0.2, 0.3));
+            p *= 17.0;
+            return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+        }
+
+        float noise3D(vec3 x) {
+            vec3 i = floor(x);
+            vec3 f = fract(x);
+            f = f * f * (3.0 - 2.0 * f);
+            float n000 = hash31(i + vec3(0.0, 0.0, 0.0));
+            float n100 = hash31(i + vec3(1.0, 0.0, 0.0));
+            float n010 = hash31(i + vec3(0.0, 1.0, 0.0));
+            float n110 = hash31(i + vec3(1.0, 1.0, 0.0));
+            float n001 = hash31(i + vec3(0.0, 0.0, 1.0));
+            float n101 = hash31(i + vec3(1.0, 0.0, 1.0));
+            float n011 = hash31(i + vec3(0.0, 1.0, 1.0));
+            float n111 = hash31(i + vec3(1.0, 1.0, 1.0));
+            return mix(mix(mix(n000, n100, f.x), mix(n010, n110, f.x), f.y),
+                       mix(mix(n001, n101, f.x), mix(n011, n111, f.x), f.y), f.z);
+        }
+
+        #pragma body
+        float phi = _surface.diffuseTexcoord.x * 6.2831853;
+        float theta = _surface.diffuseTexcoord.y * 3.14159265;
+        vec3 pos = vec3(sin(theta) * cos(phi), cos(theta), sin(theta) * sin(phi));
+        float g1 = noise3D(pos * 10.0 + vec3(u_time * 0.08, 0.0, 0.0));
+        float g2 = noise3D(pos * 24.0 - vec3(0.0, u_time * 0.12, 0.0));
+        float plasma = g1 * 0.65 + g2 * 0.35;
+        float ndotv = clamp(abs(dot(normalize(_surface.normal), normalize(_surface.view))), 0.0, 1.0);
+        float limb = 0.48 + 0.52 * pow(ndotv, 0.6);
+        vec3 c1 = vec3(\(c1.r), \(c1.g), \(c1.b));
+        vec3 c2 = vec3(\(c2.r), \(c2.g), \(c2.b));
+        _surface.emission = vec4(mix(c2, c1, plasma) * limb * 1.25, 1.0);
         """
     }
 
@@ -513,7 +667,7 @@ final class SpaceSimulationController: ObservableObject {
             let renderer = UIGraphicsImageRenderer(size: CGSize(width: size, height: size))
             let img = renderer.image { context in
                 let ctx = context.cgContext
-                ctx.setFillColor(UIColor(red: 0.006, green: 0.009, blue: 0.018, alpha: 1.0).cgColor)
+                ctx.setFillColor(UIColor(red: 0.005, green: 0.008, blue: 0.016, alpha: 1.0).cgColor)
                 ctx.fill(CGRect(x: 0, y: 0, width: size, height: size))
 
                 var rng: UInt64 = UInt64(face + 1) &* 0x9E3779B97F4A7C15
@@ -523,10 +677,10 @@ final class SpaceSimulationController: ObservableObject {
                 }
 
                 if face == 0 || face == 1 || face == 4 || face == 5 {
-                    for _ in 0..<900 {
+                    for _ in 0..<1000 {
                         let x = CGFloat(nextRand() * Double(size))
                         let y = CGFloat(Double(size) * 0.5 + (nextRand() - 0.5) * 240.0)
-                        ctx.setFillColor(UIColor(red: 0.58, green: 0.74, blue: 1.0, alpha: 0.05).cgColor)
+                        ctx.setFillColor(UIColor(red: 0.58, green: 0.74, blue: 1.0, alpha: 0.045).cgColor)
                         ctx.fillEllipse(in: CGRect(x: x, y: y, width: 4.5, height: 4.5))
                     }
                 }
@@ -545,27 +699,6 @@ final class SpaceSimulationController: ObservableObject {
         return faces
     }
 
-    private func generateRingTexture(isBlackHole: Bool) -> UIImage {
-        let size = 256
-        let renderer = UIGraphicsImageRenderer(size: CGSize(width: size, height: size))
-        return renderer.image { context in
-            let ctx = context.cgContext
-            let center = CGPoint(x: size / 2, y: size / 2)
-            for r in 65..<126 {
-                if !isBlackHole && (r == 98 || r == 99 || r == 114) { continue }
-                let alpha = isBlackHole ? CGFloat(126 - r) / 65.0 : CGFloat((r % 7) + 3) / 14.0
-                let col = isBlackHole
-                    ? UIColor(red: 1.0, green: 0.62, blue: 0.18, alpha: alpha)
-                    : UIColor(red: 0.88, green: 0.79, blue: 0.60, alpha: alpha)
-                ctx.setStrokeColor(col.cgColor)
-                ctx.setLineWidth(1.2)
-                ctx.addArc(center: center, radius: CGFloat(r), startAngle: 0, endAngle: .pi * 2, clockwise: false)
-                ctx.strokePath()
-            }
-        }
-    }
-
-    /// Свайп по экрану — свободный облёт камеры вокруг корабля (не дёргает руль!)
     func handleCameraOrbitDrag(dx: Double, dy: Double) {
         if isThirdPerson {
             orbitYaw -= Float(dx * 0.006)
@@ -597,7 +730,7 @@ final class SpaceSimulationController: ObservableObject {
         throttle = 0
         shipVelocityMetersPerSec = .zero
         let bodyPos = body.currentPosition(simulationTime: simulationTimeSeconds, allBodies: UniverseCatalog.bodies)
-        let orbitDist = body.radiusMeters * 2.8
+        let orbitDist = body.radiusMeters * (body.id == "sgr_a" ? 5.5 : 2.9)
         shipPositionMeters = bodyPos + SIMD3<Double>(orbitDist * 0.6, orbitDist * 0.25, orbitDist * 0.75)
         alignToTarget()
     }
@@ -611,7 +744,6 @@ final class SpaceSimulationController: ObservableObject {
         let simDt = realDt * warp
         simulationTimeSeconds += simDt
 
-        // Плавное управление рулём через виртуальный джойстик + инерция и крен корпуса
         let targetYawRate = -Double(stickInput.x) * 1.45
         let targetPitchRate = -Double(stickInput.y) * 1.15
         let damp = min(1.0, realDt * 6.5)
@@ -631,7 +763,6 @@ final class SpaceSimulationController: ObservableObject {
             r: Float(shipOrientation.real)
         )
 
-        // Визуальный крен корабля и пружинное отставание камеры — создаёт живое ощущение полёта корабля в космосе!
         let desiredBank = Float(angularVelYaw * 0.35)
         let desiredPitchVis = Float(angularVelPitch * 0.18)
         shipVisualNode.eulerAngles.z += (desiredBank - shipVisualNode.eulerAngles.z) * Float(min(1.0, realDt * 8.0))
@@ -643,7 +774,6 @@ final class SpaceSimulationController: ObservableObject {
             cameraBoomNode.eulerAngles = SCNVector3(orbitPitch + cameraLagPitch, orbitYaw + cameraLagYaw, 0)
         }
 
-        // Физика движения 1:1
         let targetSpeed = speedSteps[speedIndex].mps * throttle
         let forwardVec = shipOrientation.act(SIMD3<Double>(0, 0, -1))
         let desiredVelocity = forwardVec * targetSpeed
@@ -658,7 +788,6 @@ final class SpaceSimulationController: ObservableObject {
         shipPositionMeters += shipVelocityMetersPerSec * simDt
         let actualSpeed = simd_length(shipVelocityMetersPerSec)
 
-        // Движение 3D-пыли мимо корабля (тактильное ощущение полёта)
         if actualSpeed > 1.0 {
             let velDir = simd_normalize(shipVelocityMetersPerSec)
             let dustSpeed = Float(min(85.0, log10(actualSpeed + 1.0) * 14.0))
@@ -680,9 +809,12 @@ final class SpaceSimulationController: ObservableObject {
         }
 
         let sunDirWorld = simd_normalize(-shipPositionMeters)
-        let fSunDir = SCNVector3(Float(sunDirWorld.x), Float(sunDirWorld.y), Float(sunDirWorld.z))
         let lookTarget = SIMD3<Float>(Float(-sunDirWorld.x), Float(-sunDirWorld.y), Float(-sunDirWorld.z))
         sunLightNode.simdLook(at: lookTarget, up: SIMD3<Float>(0, 1, 0), localFront: SIMD3<Float>(0, 0, -1))
+
+        // Инверсная ориентация камеры для расчёта направления на Солнце в View Space (для атмосферы)
+        let camWorldQuat = cameraNode.simdWorldOrientation
+        let invCamQuat = simd_inverse(camWorldQuat)
 
         for body in UniverseCatalog.bodies {
             guard let node = bodyNodes[body.id] else { continue }
@@ -698,16 +830,26 @@ final class SpaceSimulationController: ObservableObject {
             node.simdPosition = SIMD3<Float>(Float(renderPos.x), Float(renderPos.y), Float(renderPos.z))
             node.simdScale = SIMD3<Float>(repeating: Float(renderRadius))
 
+            var spinAngle: Float = 0
             if body.rotationPeriodSeconds != 0, let mesh = planetMeshNodes[body.id] {
                 let spin = (2.0 * .pi / body.rotationPeriodSeconds) * simulationTimeSeconds
-                mesh.eulerAngles.y = Float(spin.truncatingRemainder(dividingBy: 2.0 * .pi))
+                spinAngle = Float(spin.truncatingRemainder(dividingBy: 2.0 * .pi))
+                mesh.eulerAngles.y = spinAngle
             }
 
             if !body.isStar {
-                let toSun = simd_normalize(-bodyPos)
-                let sunVec = NSValue(scnVector3: SCNVector3(Float(toSun.x), Float(toSun.y), Float(toSun.z)))
-                planetMaterials[body.id]?.setValue(sunVec, forKey: "sunDir")
-                atmoMaterials[body.id]?.setValue(sunVec, forKey: "sunDir")
+                let toSunWorld = simd_normalize(-bodyPos)
+                let toSunF = SIMD3<Float>(Float(toSunWorld.x), Float(toSunWorld.y), Float(toSunWorld.z))
+
+                // Переводим вектор Солнца в локальную систему координат вращающейся планеты (для огней городов и дымки)
+                let invTilt = simd_quatf(angle: -Float(body.axialTiltRad), axis: SIMD3<Float>(0, 0, 1))
+                let invSpin = simd_quatf(angle: -spinAngle, axis: SIMD3<Float>(0, 1, 0))
+                let sunLocal = (invSpin * invTilt).act(toSunF)
+                planetMaterials[body.id]?.setValue(NSValue(scnVector3: SCNVector3(sunLocal.x, sunLocal.y, sunLocal.z)), forKey: "sunDirLocal")
+
+                // Переводим вектор Солнца в View Space камеры (для атмосферы)
+                let sunView = invCamQuat.act(toSunF)
+                atmoMaterials[body.id]?.setValue(NSValue(scnVector3: SCNVector3(sunView.x, sunView.y, sunView.z)), forKey: "sunDirView")
             }
         }
 
@@ -901,7 +1043,6 @@ struct ContentView: View {
                 Spacer()
 
                 HStack(alignment: .bottom, spacing: 12) {
-                    // Виртуальный джойстик пилотирования слева снизу
                     VirtualFlightStick { pt in
                         sim.stickInput = pt
                     }
