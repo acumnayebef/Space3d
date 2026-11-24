@@ -101,6 +101,7 @@ final class SpaceSimulationController: ObservableObject {
     @Published var evaTempText: String = "15 °C"
     @Published var evaScannerOpen: Bool = false
     @Published var evaScanReport: SurfaceScanReport? = nil
+    @Published var isMainMenu: Bool = true
 
     let speedSteps: [(label: String, mps: Double)] = [
         ("1.5 км/с", 1_500),
@@ -498,8 +499,9 @@ final class SpaceSimulationController: ObservableObject {
     }
 
     private func updateOrbitLines() {
-        orbitLinesNode.isHidden = !showOrbits
-        guard showOrbits else { return }
+        let shouldHide = isMainMenu || !showOrbits
+        orbitLinesNode.isHidden = shouldHide
+        guard !shouldHide else { return }
 
         var vertices: [SCNVector3] = []
         var indices: [Int32] = []
@@ -1470,6 +1472,7 @@ final class SpaceSimulationController: ObservableObject {
     }
 
     func handleCameraOrbitDrag(dx: Double, dy: Double) {
+        guard !isMainMenu else { return }
         if walkingState {
             evaYaw -= dx * 0.0055
             evaPitch = max(-1.25, min(1.30, evaPitch - dy * 0.0055))
@@ -1915,6 +1918,14 @@ final class SpaceSimulationController: ObservableObject {
         let realDt = min(0.05, currentTime - lastUpdateTime)
         lastUpdateTime = currentTime
         frameCounter += 1
+
+        if isMainMenu {
+            shipVelocityMetersPerSec = .zero
+            orbitYaw += Float(realDt * 0.07)
+            if isThirdPerson && !isFreeCamera && !walkingState {
+                cameraBoomNode.eulerAngles = SCNVector3(orbitPitch, orbitYaw, 0)
+            }
+        }
 
         let timeDir: Double = isTimeReversed ? -1.0 : 1.0
         let warp = isTimePaused ? 0.0 : (timeWarpSteps[timeWarpIndex].mult * timeDir)
@@ -2482,7 +2493,7 @@ final class SpaceSimulationController: ObservableObject {
             }
 
             let hideSurfaceMarker = terrainVisible && body.id == nearestBody.id && updatedSurfaceDist < 100_000.0
-            if showMarkers && !hideSurfaceMarker {
+            if showMarkers && !walkingState && !isMainMenu && !hideSurfaceMarker {
                 let projected = renderer.projectPoint(node.position)
                 if projected.z > 0.0 && projected.z < 1.0 {
                     let px = CGFloat(projected.x)
@@ -2522,7 +2533,9 @@ final class SpaceSimulationController: ObservableObject {
         let remainingMarkers = max(0, 18 - prioritizedMarkers.count)
         let newMarkers = prioritizedMarkers + otherMarkers.prefix(remainingMarkers).map { $0.marker }
 
-        if frameCounter % 2 == 0 {
+        if isMainMenu {
+            orbitLinesNode.isHidden = true
+        } else if frameCounter % 2 == 0 {
             updateOrbitLines()
         }
 
@@ -2736,6 +2749,226 @@ struct SceneViewContainer: UIViewRepresentable {
     }
 }
 
+enum MainMenuTab {
+    case none
+    case settings
+    case authors
+}
+
+struct MainMenuOverlay: View {
+    @ObservedObject var sim: SpaceSimulationController
+    @State private var menuSubscreen: MainMenuTab = .none
+    @State private var selectedMenuIndex: Int = 0
+    private let telegramURL = URL(string: "https://t.me/xantapers")!
+
+    var body: some View {
+        ZStack(alignment: .leading) {
+            LinearGradient(
+                colors: [
+                    Color.black.opacity(0.84),
+                    Color.black.opacity(0.56),
+                    Color.black.opacity(0.18),
+                    Color.clear
+                ],
+                startPoint: .leading,
+                endPoint: .trailing
+            )
+            .ignoresSafeArea()
+            .allowsHitTesting(false)
+
+            HStack(alignment: .center, spacing: 28) {
+                VStack(alignment: .leading, spacing: 0) {
+                    Spacer(minLength: 18)
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("S.P.A.C.E. 3D")
+                            .font(.system(size: 34, weight: .black, design: .monospaced))
+                            .tracking(4)
+                            .foregroundColor(Color(red: 0.92, green: 0.95, blue: 0.97))
+                            .shadow(color: Color.black.opacity(0.8), radius: 6, x: 0, y: 2)
+
+                        Rectangle()
+                            .fill(
+                                LinearGradient(
+                                    colors: [Color.white.opacity(0.65), Color.cyan.opacity(0.35), Color.clear],
+                                    startPoint: .leading,
+                                    endPoint: .trailing
+                                )
+                            )
+                            .frame(width: 240, height: 1.5)
+
+                        Text("СИМУЛЯТОР ВСЕЛЕННОЙ 1:1")
+                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                            .tracking(4)
+                            .foregroundColor(.white.opacity(0.75))
+                    }
+                    .padding(.bottom, 26)
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        menuButton(title: "ИГРАТЬ", index: 0) {
+                            selectedMenuIndex = 0
+                            menuSubscreen = .none
+                            sim.isMainMenu = false
+                        }
+
+                        menuButton(title: "НАСТРОЙКИ", index: 1) {
+                            selectedMenuIndex = 1
+                            menuSubscreen = (menuSubscreen == .settings) ? .none : .settings
+                        }
+
+                        menuButton(title: "АВТОРЫ", index: 2) {
+                            selectedMenuIndex = 2
+                            menuSubscreen = (menuSubscreen == .authors) ? .none : .authors
+                        }
+                    }
+
+                    Spacer()
+
+                    HStack(spacing: 8) {
+                        Text("SPACE 1:1")
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(Color.white.opacity(0.14))
+                            .cornerRadius(3)
+                        Text("ЗЕМЛЯ • МЛЕЧНЫЙ ПУТЬ • @xantapers")
+                            .foregroundColor(.white.opacity(0.55))
+                    }
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.85))
+                    .padding(.bottom, 14)
+                }
+                .padding(.leading, 34)
+                .frame(width: 310, alignment: .leading)
+
+                if menuSubscreen == .settings {
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack {
+                            Text("НАСТРОЙКИ")
+                                .font(.system(size: 16, weight: .bold, design: .monospaced))
+                                .tracking(3)
+                                .foregroundColor(.white)
+                            Spacer()
+                            Button("НАЗАД") {
+                                menuSubscreen = .none
+                                selectedMenuIndex = 0
+                            }
+                            .font(.system(size: 11, weight: .bold, design: .monospaced))
+                            .foregroundColor(.cyan)
+                        }
+
+                        Rectangle()
+                            .fill(Color.white.opacity(0.20))
+                            .frame(height: 1)
+
+                        Spacer()
+
+                        Text("Раздел настроек пока пуст.")
+                            .font(.system(size: 13, weight: .medium, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.65))
+                            .frame(maxWidth: .infinity, alignment: .center)
+
+                        Spacer()
+                    }
+                    .padding(18)
+                    .frame(width: 340, height: 220)
+                    .background(Color.black.opacity(0.76))
+                    .overlay(Rectangle().stroke(Color.white.opacity(0.22), lineWidth: 1))
+                } else if menuSubscreen == .authors {
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack {
+                            Text("АВТОРЫ")
+                                .font(.system(size: 16, weight: .bold, design: .monospaced))
+                                .tracking(3)
+                                .foregroundColor(.white)
+                            Spacer()
+                            Button("НАЗАД") {
+                                menuSubscreen = .none
+                                selectedMenuIndex = 0
+                            }
+                            .font(.system(size: 11, weight: .bold, design: .monospaced))
+                            .foregroundColor(.cyan)
+                        }
+
+                        Rectangle()
+                            .fill(Color.white.opacity(0.20))
+                            .frame(height: 1)
+
+                        Text("Space 3D — Симулятор Вселенной 1:1")
+                            .font(.system(size: 13, weight: .bold, design: .monospaced))
+                            .foregroundColor(Color(red: 0.90, green: 0.94, blue: 0.98))
+
+                        Text("Следите за разработкой, обновлениями и новыми мирами в официальном Telegram-канале автора:")
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.75))
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        HStack(spacing: 6) {
+                            Text("Telegram-канал:")
+                                .font(.system(size: 12, design: .monospaced))
+                                .foregroundColor(.gray)
+                            Text("@xantapers")
+                                .font(.system(size: 12, weight: .bold, design: .monospaced))
+                                .foregroundColor(.cyan)
+                        }
+
+                        Spacer()
+
+                        Link(destination: telegramURL) {
+                            HStack(spacing: 8) {
+                                Image(systemName: "paperplane.fill")
+                                Text("Перейти в Telegram: @xantapers")
+                            }
+                            .font(.system(size: 12, weight: .bold, design: .monospaced))
+                            .foregroundColor(.black)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                            .background(Color(red: 0.90, green: 0.91, blue: 0.87))
+                            .cornerRadius(4)
+                        }
+                    }
+                    .padding(18)
+                    .frame(width: 360, height: 235)
+                    .background(Color.black.opacity(0.78))
+                    .overlay(Rectangle().stroke(Color.white.opacity(0.22), lineWidth: 1))
+                }
+
+                Spacer()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func menuButton(title: String, index: Int, action: @escaping () -> Void) -> some View {
+        let isSelected = (selectedMenuIndex == index)
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 15, weight: .bold, design: .monospaced))
+                .tracking(2.5)
+                .foregroundColor(isSelected ? Color(red: 0.08, green: 0.10, blue: 0.12) : Color(red: 0.88, green: 0.90, blue: 0.90))
+                .frame(width: 220, alignment: .leading)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .background(
+                    Group {
+                        if isSelected {
+                            LinearGradient(
+                                colors: [
+                                    Color(red: 0.91, green: 0.90, blue: 0.85),
+                                    Color(red: 0.84, green: 0.85, blue: 0.82).opacity(0.92),
+                                    Color(red: 0.84, green: 0.85, blue: 0.82).opacity(0.0)
+                                ],
+                                startPoint: .leading,
+                                endPoint: .trailing
+                            )
+                        } else {
+                            Color.clear
+                        }
+                    }
+                )
+        }
+        .buttonStyle(.plain)
+    }
+}
+
 struct ContentView: View {
     @StateObject private var sim = SpaceSimulationController()
     @State private var showCatalog = false
@@ -2746,7 +2979,11 @@ struct ContentView: View {
         ZStack {
             SceneViewContainer(sim: sim)
 
-            if sim.reentryHeat > 0.04 {
+            if sim.isMainMenu {
+                MainMenuOverlay(sim: sim)
+            }
+
+            if sim.reentryHeat > 0.04 && !sim.isMainMenu {
                 ZStack {
                     RadialGradient(
                         colors: [
@@ -2775,7 +3012,7 @@ struct ContentView: View {
                 .allowsHitTesting(false)
             }
 
-            if sim.showMarkers && !sim.isWalkingOnSurface {
+            if sim.showMarkers && !sim.isWalkingOnSurface && !sim.isMainMenu {
                 ForEach(sim.screenMarkers) { marker in
                     Button(action: {
                         if let found = UniverseCatalog.bodies.first(where: { $0.id == marker.id }) {
@@ -2805,7 +3042,8 @@ struct ContentView: View {
                 }
             }
 
-            VStack {
+            if !sim.isMainMenu {
+                VStack {
                 if sim.isWalkingOnSurface {
                     HStack(spacing: 8) {
                         HStack(spacing: 6) {
@@ -2964,6 +3202,19 @@ struct ContentView: View {
                     .padding(.bottom, 10)
                 } else {
                     HStack(spacing: 6) {
+                        Button(action: {
+                            showCatalog = false
+                            showInfo = false
+                            sim.isMainMenu = true
+                        }) {
+                            Image(systemName: "line.3.horizontal")
+                                .font(.system(size: 13, weight: .bold))
+                                .padding(7)
+                                .background(Color.black.opacity(0.72))
+                                .overlay(Circle().stroke(Color.white.opacity(0.25), lineWidth: 1))
+                                .clipShape(Circle())
+                        }
+
                         Button(action: { showCatalog.toggle(); showInfo = false }) {
                             HStack(spacing: 5) {
                                 Image(systemName: "globe.americas.fill")
@@ -3249,9 +3500,10 @@ struct ContentView: View {
                     .padding(.horizontal, 12)
                     .padding(.bottom, 10)
                 }
+                }
             }
 
-            if showInfo && !sim.isWalkingOnSurface {
+            if showInfo && !sim.isWalkingOnSurface && !sim.isMainMenu {
                 let b = sim.targetBody
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
@@ -3344,7 +3596,7 @@ struct ContentView: View {
                 .cornerRadius(16)
             }
 
-            if showCatalog && !sim.isWalkingOnSurface {
+            if showCatalog && !sim.isWalkingOnSurface && !sim.isMainMenu {
                 let filteredBodies = UniverseCatalog.bodies.filter {
                     selectedCategory == .all || $0.category == selectedCategory
                 }

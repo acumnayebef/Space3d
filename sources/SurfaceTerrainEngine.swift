@@ -778,6 +778,9 @@ final class SurfaceTerrainEngine {
         let az = abs(localUp.z)
         let dominantAxis = (ay >= ax && ay >= az) ? 1 : ((ax >= ay && ax >= az) ? 0 : 2)
         let radiusKm = body.radiusMeters / 1_000.0
+        let anchorUV = projectKmUV(localDir: localUp, dominantAxis: dominantAxis, radiusKm: radiusKm)
+        let uvOriginX = floor(anchorUV.x)
+        let uvOriginY = floor(anchorUV.y)
 
         let isLowAlt = altitudeMeters < 1_500.0
         let gridN = isLowAlt ? 85 : 73
@@ -822,7 +825,8 @@ final class SurfaceTerrainEngine {
                 let idx = iz * gridN + ix
                 positionsSIMD[idx] = scenePos
                 vertexHeights[idx] = vertexHeight
-                uvs[idx] = projectKmUV(localDir: localDir, dominantAxis: dominantAxis, radiusKm: radiusKm)
+                let rawUV = projectKmUV(localDir: localDir, dominantAxis: dominantAxis, radiusKm: radiusKm)
+                uvs[idx] = CGPoint(x: rawUV.x - uvOriginX, y: rawUV.y - uvOriginY)
                 let cBase = idx * 3
                 colorFloats[cBase] = sample.color.x
                 colorFloats[cBase + 1] = sample.color.y
@@ -904,7 +908,7 @@ final class SurfaceTerrainEngine {
         terrainMat.normal.mipFilter = .linear
         terrainMat.normal.maxAnisotropy = 8
         terrainMat.normal.contentsTransform = SCNMatrix4MakeScale(36.0, 36.0, 1.0)
-        terrainMat.normal.intensity = 1.15
+        terrainMat.normal.intensity = 1.35
         terrainMat.roughness.contents = body.isIcyWorld ? 0.42 : 0.90
         terrainMat.metalness.contents = 0.02
         terrainMat.shaderModifiers = [.surface: terrainShaderModifier(for: body)]
@@ -925,6 +929,8 @@ final class SurfaceTerrainEngine {
                 upF: upF,
                 dominantAxis: dominantAxis,
                 radiusKm: radiusKm,
+                uvOriginX: uvOriginX,
+                uvOriginY: uvOriginY,
                 patchHalfExtent: patchHalfExtent,
                 whitePixel: whitePixel,
                 compress: compress
@@ -960,6 +966,8 @@ final class SurfaceTerrainEngine {
         upF: SIMD3<Float>,
         dominantAxis: Int,
         radiusKm: Double,
+        uvOriginX: Double,
+        uvOriginY: Double,
         patchHalfExtent: Double,
         whitePixel: UIImage,
         compress: (SIMD3<Double>) -> (pos: SIMD3<Float>, scaleFactor: Double)
@@ -990,7 +998,8 @@ final class SurfaceTerrainEngine {
                 posSIMD[iz * oceanN + ix] = scenePos
                 positions.append(SCNVector3(scenePos.x, scenePos.y, scenePos.z))
                 normals.append(SCNVector3(Float(dirWorld.x), Float(dirWorld.y), Float(dirWorld.z)))
-                uvs.append(projectKmUV(localDir: localDir, dominantAxis: dominantAxis, radiusKm: radiusKm))
+                let rawUV = projectKmUV(localDir: localDir, dominantAxis: dominantAxis, radiusKm: radiusKm)
+                uvs.append(CGPoint(x: rawUV.x - uvOriginX, y: rawUV.y - uvOriginY))
             }
         }
 
@@ -1425,8 +1434,6 @@ final class SurfaceTerrainEngine {
         vec3 baseCol = clamp(_surface.diffuse.rgb * 1.42, 0.0, 1.0);
         vec3 col = baseCol;
         float rough = 0.90;
-        float microH = 0.0;
-        float bumpStrength = 5.5;
 
         int tMode = \(mode);
         if (tMode == 1) {
@@ -1443,12 +1450,9 @@ final class SurfaceTerrainEngine {
             float cloudSh = smoothstep(0.56, 0.76, fbm2D(km * 0.06 + vec2(u_time * 0.01, 0.0)));
             col *= (1.0 - cloudSh * 0.30);
 
-            microH = ridge * 0.40 + micro * 0.25 * medFade + fine * 0.20 * fineFade + grass * 0.15 * closeFade;
-            bumpStrength = 5.0;
             rough = mix(0.88, 0.74, cliff);
         } else if (tMode == 2) {
             float cr = crater2D(km * 0.35);
-            float ridge = ridged2D(km * 0.65);
             float dunes = (sin(km.x * 16.0 + fbm2D(km * 2.5) * 6.0) * 0.5 + 0.5) * fineFade + 0.5 * (1.0 - fineFade);
             float micro = fbm2D(km * 12.0) * medFade + 0.5 * (1.0 - medFade);
             float grit = noise2D(km * 180.0) * closeFade + 0.5 * (1.0 - closeFade);
@@ -1457,11 +1461,8 @@ final class SurfaceTerrainEngine {
             col = mix(col, vec3(0.22, 0.09, 0.05), clamp(-cr, 0.0, 0.6) * 0.45);
             col = mix(col, vec3(0.62, 0.34, 0.18), smoothstep(0.08, 0.38, cr) * 0.35);
 
-            microH = cr * 0.35 + ridge * 0.30 + dunes * 0.15 * fineFade + grit * 0.20 * closeFade;
-            bumpStrength = 5.5;
             rough = 0.92;
         } else if (tMode == 3) {
-            float ridge = ridged2D(km * 0.80);
             float frac = ridged2D(km * 3.5) * medFade;
             float micro = fbm2D(km * 14.0) * medFade + 0.5 * (1.0 - medFade);
             float grit = noise2D(km * 190.0) * closeFade + 0.5 * (1.0 - closeFade);
@@ -1469,8 +1470,6 @@ final class SurfaceTerrainEngine {
             col = baseCol * (0.80 + 0.36 * micro + 0.14 * (grit - 0.5));
             col = mix(col, vec3(0.14, 0.08, 0.04), smoothstep(0.55, 0.90, frac) * 0.45);
 
-            microH = ridge * 0.42 + frac * 0.28 + micro * 0.18 * medFade + grit * 0.12 * closeFade;
-            bumpStrength = 5.0;
             rough = 0.86;
         } else if (tMode == 5) {
             float crev = ridged2D(km * 1.4);
@@ -1480,8 +1479,6 @@ final class SurfaceTerrainEngine {
             col = mix(baseCol * (0.86 + 0.28 * micro), vec3(0.24, 0.44, 0.62), smoothstep(0.62, 0.92, crev) * 0.55);
             col += vec3(0.08, 0.10, 0.12) * (frost - 0.5);
 
-            microH = crev * 0.48 + micro * 0.28 * medFade + frost * 0.24 * closeFade;
-            bumpStrength = 4.5;
             rough = mix(0.30, 0.58, crev);
         } else {
             float cBig = crater2D(km * 0.12);
@@ -1495,14 +1492,9 @@ final class SurfaceTerrainEngine {
             col *= (1.0 - clamp(-cSum, 0.0, 0.60) * 0.48);
             col += vec3(0.10, 0.10, 0.11) * smoothstep(0.05, 0.35, cSum);
 
-            microH = cBig * 0.38 + cMed * 0.28 + cSmall * 0.16 + dust * 0.18 * closeFade;
-            bumpStrength = 6.0;
             rough = 0.95;
         }
 
-        bumpStrength *= fineFade;
-        vec3 dN = vec3(dFdx(microH), dFdy(microH), 0.0);
-        _surface.normal = normalize(_surface.normal - dN * bumpStrength);
         _surface.diffuse = vec4(col, 1.0);
         _surface.roughness = rough;
         """
