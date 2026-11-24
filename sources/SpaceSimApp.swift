@@ -16,21 +16,23 @@ struct SpaceSimApp: App {
 final class SpaceSimulationController: ObservableObject {
     let scene = SCNScene()
     let shipNode = SCNNode()
+    let thirdPersonMeshNode = SCNNode()
+    let cockpitMeshNode = SCNNode()
     let cameraNode = SCNNode()
     let sunLightNode = SCNNode()
+    var exhaustNodes: [SCNNode] = []
 
-    // 64-битная позиция корабля в метрах (старт на орбите Земли, высота 600 км)
-    var shipPositionMeters = SIMD3<Double>(-UniverseCatalog.au, 0, 6_971_000)
-    var shipOrientation = simd_quatd(ix: 0, iy: 0, iz: 0, r: 1)
+    // Старт на орбите Земли: виден терминатор, континенты, облака и Луна вдали
+    var shipPositionMeters = SIMD3<Double>(-UniverseCatalog.au + 11_500_000, 3_500_000, 12_500_000)
+    var shipOrientation = simd_quatd(angle: 0.65, axis: simd_normalize(SIMD3<Double>(-0.2, 1.0, 0.0)))
 
     @Published var speedIndex: Int = 0
     @Published var throttle: Double = 0.0
-    @Published var targetBody: CelestialBody = UniverseCatalog.bodies[3] // Земля
-    @Published var distanceText: String = "600 км"
+    @Published var targetBody: CelestialBody = UniverseCatalog.bodies[3]
+    @Published var distanceText: String = "11.0 тыс. км"
     @Published var etaText: String = "Стоп"
     @Published var isThirdPerson: Bool = true
 
-    // Реальные ступени скорости FSD (от маневровой до межзвёздной)
     let speedSteps: [(label: String, mps: Double)] = [
         ("1.5 км/с", 1_500),
         ("11.2 км/с", 11_200),
@@ -43,6 +45,7 @@ final class SpaceSimulationController: ObservableObject {
     ]
 
     private var bodyNodes: [String: SCNNode] = [:]
+    private var cloudNodes: [String: SCNNode] = [:]
     private var lastUpdateTime: TimeInterval = 0
 
     init() {
@@ -52,105 +55,257 @@ final class SpaceSimulationController: ObservableObject {
     private func setupScene() {
         scene.background.contents = UIColor.black
 
-        // Освещение от Солнца
+        // Направленный солнечный свет без пересвета белым[span_13](start_span)[span_13](end_span)[span_14](start_span)[span_14](end_span)
         let sunLight = SCNLight()
-        sunLight.type = .omni
-        sunLight.intensity = 2200
-        sunLight.attenuationEndDistance = 1e12
+        sunLight.type = .directional
+        sunLight.intensity = 1350
+        sunLight.color = UIColor(red: 1.0, green: 0.98, blue: 0.94, alpha: 1.0)
         sunLightNode.light = sunLight
         scene.rootNode.addChildNode(sunLightNode)
 
+        // Лёгкая подсветка ночной стороны
         let ambient = SCNLight()
         ambient.type = .ambient
-        ambient.intensity = 90
+        ambient.intensity = 45
+        ambient.color = UIColor(red: 0.12, green: 0.16, blue: 0.25, alpha: 1.0)
         let ambientNode = SCNNode()
         ambientNode.light = ambient
         scene.rootNode.addChildNode(ambientNode)
 
-        // Создаём 3D-звездолёт (многополигональный корпус + сопла)
-        buildShipMesh()
+        // Корабль (3-е лицо) и кабина (1-е лицо)
+        buildThirdPersonShip()
+        buildFirstPersonCockpit()
+        shipNode.addChildNode(thirdPersonMeshNode)
+        shipNode.addChildNode(cockpitMeshNode)
         scene.rootNode.addChildNode(shipNode)
 
-        // Камера
         let cam = SCNCamera()
-        cam.zNear = 0.5
-        cam.zFar = 1_000_000
-        cam.fieldOfView = 65
+        cam.zNear = 0.1
+        cam.zFar = 1_200_000
+        cam.fieldOfView = 62
         cameraNode.camera = cam
         shipNode.addChildNode(cameraNode)
         updateCameraMode()
 
-        // Звёздный фон (3000 процедурных звёзд на небесной сфере)
         buildStarfield()
+        buildCelestialBodies()
+    }
 
-        // Небесные тела из реального каталога
+    private func buildCelestialBodies() {
         for body in UniverseCatalog.bodies {
+            let root = SCNNode()
             let sphere = SCNSphere(radius: 1.0)
-            sphere.segmentCount = 64
+            sphere.segmentCount = 96
+
             let mat = SCNMaterial()
-            mat.diffuse.contents = uiColor(from: body.colorHex)
+            let tex = generatePlanetTexture(body: body)
+            mat.diffuse.contents = tex
+
             if body.isStar {
-                mat.emission.contents = uiColor(from: body.colorHex)
+                mat.emission.contents = tex
+                mat.lightingModel = .constant
             } else {
-                mat.roughness.contents = 0.75
-                mat.metalness.contents = 0.05
+                mat.lightingModel = .physicallyBased
+                mat.roughness.contents = body.id == "earth" ? 0.55 : 0.88
+                mat.metalness.contents = 0.02
             }
             sphere.materials = [mat]
+            let planetMesh = SCNNode(geometry: sphere)
+            root.addChildNode(planetMesh)
 
-            let node = SCNNode(geometry: sphere)
-            scene.rootNode.addChildNode(node)
-            bodyNodes[body.id] = node
+            // Слой облаков для планет с атмосферой
+            if body.hasAtmosphere && !body.isStar {
+                let cloudSphere = SCNSphere(radius: 1.012)
+                cloudSphere.segmentCount = 72
+                let cloudMat = SCNMaterial()
+                cloudMat.diffuse.contents = generateCloudTexture(seed: body.id.hashValue)
+                cloudMat.transparent.contents = cloudMat.diffuse.contents
+                cloudMat.isDoubleSided = false
+                cloudMat.writesToDepthBuffer = false
+                cloudSphere.materials = [cloudMat]
+                let cloudNode = SCNNode(geometry: cloudSphere)
+                root.addChildNode(cloudNode)
+                cloudNodes[body.id] = cloudNode
+
+                // Свечение атмосферы по краю диска (Fresnel)
+                let atmoSphere = SCNSphere(radius: 1.032)
+                atmoSphere.segmentCount = 64
+                let atmoMat = SCNMaterial()
+                let atmoColor = body.id == "mars"
+                    ? UIColor(red: 0.95, green: 0.52, blue: 0.30, alpha: 0.22)
+                    : UIColor(red: 0.30, green: 0.65, blue: 1.0, alpha: 0.25)
+                atmoMat.diffuse.contents = atmoColor
+                atmoMat.emission.contents = atmoColor
+                atmoMat.blendMode = .add
+                atmoMat.cullMode = .front
+                atmoSphere.materials = [atmoMat]
+                root.addChildNode(SCNNode(geometry: atmoSphere))
+            }
+
+            // Кольца Сатурна / аккреционный диск ЧД
+            if body.hasRings {
+                let ring = SCNTube(innerRadius: 1.35, outerRadius: 2.35, height: 0.004)
+                let ringMat = SCNMaterial()
+                ringMat.diffuse.contents = generateRingTexture(isBlackHole: body.id == "sgr_a")
+                if body.id == "sgr_a" {
+                    ringMat.emission.contents = ringMat.diffuse.contents
+                }
+                ringMat.isDoubleSided = true
+                ring.materials = [ringMat]
+                let ringNode = SCNNode(geometry: ring)
+                ringNode.eulerAngles = SCNVector3(0.42, 0.1, 0.25)
+                root.addChildNode(ringNode)
+            }
+
+            scene.rootNode.addChildNode(root)
+            bodyNodes[body.id] = root
         }
     }
 
-    private func buildShipMesh() {
-        // Основной клиновидный корпус в стиле Elite Dangerous
-        let hull = SCNBox(width: 2.8, height: 0.7, length: 6.5, chamferRadius: 0.25)
+    private func buildThirdPersonShip() {
         let hullMat = SCNMaterial()
-        hullMat.diffuse.contents = UIColor(red: 0.16, green: 0.20, blue: 0.27, alpha: 1.0)
+        hullMat.lightingModel = .physicallyBased
+        hullMat.diffuse.contents = UIColor(red: 0.18, green: 0.22, blue: 0.29, alpha: 1.0)
         hullMat.metalness.contents = 0.85
-        hullMat.roughness.contents = 0.3
-        hull.materials = [hullMat]
-        let hullNode = SCNNode(geometry: hull)
-        shipNode.addChildNode(hullNode)
+        hullMat.roughness.contents = 0.28
 
-        // Крылья
-        let wings = SCNBox(width: 7.4, height: 0.18, length: 3.2, chamferRadius: 0.08)
+        let accentMat = SCNMaterial()
+        accentMat.lightingModel = .physicallyBased
+        accentMat.diffuse.contents = UIColor(red: 0.88, green: 0.36, blue: 0.12, alpha: 1.0)
+        accentMat.metalness.contents = 0.4
+        accentMat.roughness.contents = 0.4
+
+        // Фюзеляж
+        let hull = SCNBox(width: 2.4, height: 0.65, length: 6.8, chamferRadius: 0.22)
+        hull.materials = [hullMat]
+        thirdPersonMeshNode.addChildNode(SCNNode(geometry: hull))
+
+        // Носовой обтекатель
+        let nose = SCNPyramid(width: 2.3, height: 2.6, length: 0.62)
+        nose.materials = [hullMat]
+        let noseNode = SCNNode(geometry: nose)
+        noseNode.eulerAngles.x = -.pi / 2
+        noseNode.position = SCNVector3(0, 0, -3.4)
+        thirdPersonMeshNode.addChildNode(noseNode)
+
+        // Дельта-крылья с оранжевыми законцовками
+        let wings = SCNBox(width: 7.6, height: 0.14, length: 3.1, chamferRadius: 0.06)
         wings.materials = [hullMat]
         let wingsNode = SCNNode(geometry: wings)
-        wingsNode.position = SCNVector3(0, -0.1, 1.1)
-        shipNode.addChildNode(wingsNode)
+        wingsNode.position = SCNVector3(0, -0.08, 1.2)
+        thirdPersonMeshNode.addChildNode(wingsNode)
+
+        let stripe = SCNBox(width: 7.7, height: 0.16, length: 0.45, chamferRadius: 0.04)
+        stripe.materials = [accentMat]
+        let stripeNode = SCNNode(geometry: stripe)
+        stripeNode.position = SCNVector3(0, -0.08, 2.1)
+        thirdPersonMeshNode.addChildNode(stripeNode)
 
         // Фонарь кабины
-        let canopy = SCNSphere(radius: 0.65)
+        let canopy = SCNSphere(radius: 0.6)
         let glassMat = SCNMaterial()
-        glassMat.diffuse.contents = UIColor(red: 0.05, green: 0.55, blue: 0.95, alpha: 0.85)
+        glassMat.lightingModel = .physicallyBased
+        glassMat.diffuse.contents = UIColor(red: 0.04, green: 0.45, blue: 0.85, alpha: 0.9)
         glassMat.metalness.contents = 0.95
-        glassMat.roughness.contents = 0.1
+        glassMat.roughness.contents = 0.08
         canopy.materials = [glassMat]
         let canopyNode = SCNNode(geometry: canopy)
-        canopyNode.scale = SCNVector3(1.1, 0.55, 2.1)
-        canopyNode.position = SCNVector3(0, 0.38, -1.0)
-        shipNode.addChildNode(canopyNode)
+        canopyNode.scale = SCNVector3(1.05, 0.5, 2.0)
+        canopyNode.position = SCNVector3(0, 0.36, -1.1)
+        thirdPersonMeshNode.addChildNode(canopyNode)
 
-        // Двигатели
-        for xOffset in [-1.1, 1.1] {
-            let thruster = SCNCylinder(radius: 0.32, height: 0.6)
-            let glowMat = SCNMaterial()
-            glowMat.emission.contents = UIColor(red: 0.2, green: 0.8, blue: 1.0, alpha: 1.0)
-            thruster.materials = [glowMat]
-            let tNode = SCNNode(geometry: thruster)
-            tNode.eulerAngles.x = .pi / 2
-            tNode.position = SCNVector3(Float(xOffset), 0, 3.2)
-            shipNode.addChildNode(tNode)
+        // 2 маршевых двигателя с плазменными струями
+        exhaustNodes.removeAll()
+        for xOffset in [-0.85, 0.85] {
+            let nozzle = SCNCylinder(radius: 0.28, height: 0.5)
+            nozzle.materials = [hullMat]
+            let nNode = SCNNode(geometry: nozzle)
+            nNode.eulerAngles.x = .pi / 2
+            nNode.position = SCNVector3(Float(xOffset), 0, 3.45)
+            thirdPersonMeshNode.addChildNode(nNode)
+
+            let flame = SCNCone(topRadius: 0.02, bottomRadius: 0.24, height: 2.2)
+            let flameMat = SCNMaterial()
+            flameMat.emission.contents = UIColor(red: 0.25, green: 0.82, blue: 1.0, alpha: 0.95)
+            flameMat.blendMode = .add
+            flame.materials = [flameMat]
+            let fNode = SCNNode(geometry: flame)
+            fNode.eulerAngles.x = .pi / 2
+            fNode.position = SCNVector3(Float(xOffset), 0, 4.6)
+            thirdPersonMeshNode.addChildNode(fNode)
+            exhaustNodes.append(fNode)
+        }
+    }
+
+    private func buildFirstPersonCockpit() {
+        let frameMat = SCNMaterial()
+        frameMat.lightingModel = .physicallyBased
+        frameMat.diffuse.contents = UIColor(red: 0.09, green: 0.11, blue: 0.15, alpha: 1.0)
+        frameMat.metalness.contents = 0.8
+        frameMat.roughness.contents = 0.35
+
+        let neonMat = SCNMaterial()
+        neonMat.emission.contents = UIColor(red: 0.0, green: 0.82, blue: 1.0, alpha: 1.0)
+
+        // Нижняя наклонная торпеда кабины (не перекрывает центр экрана!)[span_15](start_span)[span_15](end_span)
+        let dash = SCNBox(width: 2.2, height: 0.35, length: 0.7, chamferRadius: 0.05)
+        dash.materials = [frameMat]
+        let dashNode = SCNNode(geometry: dash)
+        dashNode.position = SCNVector3(0, -0.56, -0.85)
+        dashNode.eulerAngles.x = 0.28
+        cockpitMeshNode.addChildNode(dashNode)
+
+        // Неоновая окантовка приборной панели
+        let trim = SCNBox(width: 1.85, height: 0.015, length: 0.02, chamferRadius: 0.005)
+        trim.materials = [neonMat]
+        let trimNode = SCNNode(geometry: trim)
+        trimNode.position = SCNVector3(0, -0.39, -0.62)
+        cockpitMeshNode.addChildNode(trimNode)
+
+        // Левая и правая стойки фонаря кабины
+        for side in [-1.0, 1.0] {
+            let strut = SCNBox(width: 0.045, height: 1.15, length: 0.045, chamferRadius: 0.01)
+            strut.materials = [frameMat]
+            let sNode = SCNNode(geometry: strut)
+            sNode.position = SCNVector3(Float(side * 0.72), 0.05, -0.75)
+            sNode.eulerAngles = SCNVector3(0.22, 0, Float(side * 0.26))
+            cockpitMeshNode.addChildNode(sNode)
+        }
+
+        // Верхняя перекладина фонаря
+        let topBar = SCNBox(width: 1.35, height: 0.04, length: 0.04, chamferRadius: 0.01)
+        topBar.materials = [frameMat]
+        let topNode = SCNNode(geometry: topBar)
+        topNode.position = SCNVector3(0, 0.56, -0.64)
+        cockpitMeshNode.addChildNode(topNode)
+
+        // Коллиматорный прицел в центре лобового стекла
+        let crosshair = SCNTorus(ringRadius: 0.045, pipeRadius: 0.0025)
+        crosshair.materials = [neonMat]
+        let chNode = SCNNode(geometry: crosshair)
+        chNode.eulerAngles.x = .pi / 2
+        chNode.position = SCNVector3(0, 0.02, -0.95)
+        cockpitMeshNode.addChildNode(chNode)
+    }
+
+    func updateCameraMode() {
+        thirdPersonMeshNode.isHidden = !isThirdPerson
+        cockpitMeshNode.isHidden = isThirdPerson
+        if isThirdPerson {
+            cameraNode.position = SCNVector3(0, 2.6, 12.5)
+            cameraNode.eulerAngles = SCNVector3(-0.12, 0, 0)
+        } else {
+            cameraNode.position = SCNVector3(0, 0, 0)
+            cameraNode.eulerAngles = SCNVector3(0, 0, 0)
         }
     }
 
     private func buildStarfield() {
-        let starSphere = SCNSphere(radius: 800_000)
-        starSphere.segmentCount = 32
+        let starSphere = SCNSphere(radius: 950_000)
+        starSphere.segmentCount = 48
         let mat = SCNMaterial()
         mat.isDoubleSided = true
+        mat.lightingModel = .constant
         mat.emission.contents = generateStarTexture()
         starSphere.materials = [mat]
         let bgNode = SCNNode(geometry: starSphere)
@@ -158,17 +313,35 @@ final class SpaceSimulationController: ObservableObject {
     }
 
     private func generateStarTexture() -> UIImage {
-        let size = CGSize(width: 2048, height: 1024)
-        UIGraphicsBeginImageContextWithOptions(size, true, 1.0)
+        let w = 2048, h = 1024
+        UIGraphicsBeginImageContextWithOptions(CGSize(width: w, height: h), true, 1.0)
         guard let ctx = UIGraphicsGetCurrentContext() else { return UIImage() }
         ctx.setFillColor(UIColor.black.cgColor)
-        ctx.fill(CGRect(origin: .zero, size: size))
-        for i in 0..<4500 {
-            let x = CGFloat((i * 73856093) % 2048)
-            let y = CGFloat((i * 19349663) % 1024)
-            let r = CGFloat((i % 3) + 1) * 0.7
-            let alpha = CGFloat((i % 70) + 30) / 100.0
-            ctx.setFillColor(UIColor(white: 1.0, alpha: alpha).cgColor)
+        ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+
+        // Полоса Млечного Пути
+        for i in 0..<2500 {
+            let x = CGFloat((i * 48271) % w)
+            let spread = sin(Double(x) / Double(w) * .pi * 2.0) * 140.0
+            let offset = Double((i * 16807) % 240) - 120.0
+            let y = CGFloat(Double(h) * 0.5 + spread + offset * 0.65)
+            ctx.setFillColor(UIColor(red: 0.65, green: 0.78, blue: 1.0, alpha: 0.08).cgColor)
+            ctx.fillEllipse(in: CGRect(x: x, y: y, width: 3.5, height: 3.5))
+        }
+
+        // Яркие звёзды разного спектрального цвета
+        let starColors: [UIColor] = [
+            .white,
+            UIColor(red: 0.75, green: 0.88, blue: 1.0, alpha: 1.0),
+            UIColor(red: 1.0, green: 0.92, blue: 0.75, alpha: 1.0),
+            UIColor(red: 1.0, green: 0.72, blue: 0.55, alpha: 1.0)
+        ]
+        for i in 0..<6000 {
+            let x = CGFloat((i * 73856093) % w)
+            let y = CGFloat((i * 19349663) % h)
+            let r = (i % 14 == 0) ? CGFloat(2.1) : CGFloat(1.1)
+            let alpha = CGFloat((i % 75) + 25) / 100.0
+            ctx.setFillColor(starColors[i % starColors.count].withAlphaComponent(alpha).cgColor)
             ctx.fillEllipse(in: CGRect(x: x, y: y, width: r, height: r))
         }
         let img = UIGraphicsGetImageFromCurrentImageContext() ?? UIImage()
@@ -176,14 +349,85 @@ final class SpaceSimulationController: ObservableObject {
         return img
     }
 
-    func updateCameraMode() {
-        if isThirdPerson {
-            cameraNode.position = SCNVector3(0, 3.2, 13.5)
-            cameraNode.eulerAngles = SCNVector3(-0.14, 0, 0)
+    private func generatePlanetTexture(body: CelestialBody) -> UIImage {
+        let w = 512, h = 256
+        UIGraphicsBeginImageContextWithOptions(CGSize(width: w, height: h), true, 1.0)
+        guard let ctx = UIGraphicsGetCurrentContext() else { return UIImage() }
+        let c1 = uiColor(from: body.colorHex)
+        let c2 = uiColor(from: body.secondaryHex)
+        ctx.setFillColor(c1.cgColor)
+        ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+
+        let seed = abs(body.id.hashValue)
+        if body.id == "jupiter" || body.id == "saturn" || body.id == "uranus" || body.id == "neptune" {
+            // Широтные облачные пояса газовых гигантов
+            for row in 0..<32 {
+                let y = CGFloat(row) * CGFloat(h) / 32.0
+                let bandH = CGFloat(h) / 32.0 + 1
+                let mix = ((row + seed) % 3 == 0) ? c2.withAlphaComponent(0.65) : c1.withAlphaComponent(0.75)
+                ctx.setFillColor(mix.cgColor)
+                ctx.fill(CGRect(x: 0, y: y, width: CGFloat(w), height: bandH))
+            }
         } else {
-            cameraNode.position = SCNVector3(0, 0.55, -1.6)
-            cameraNode.eulerAngles = SCNVector3(0, 0, 0)
+            // Процедурные материки / кратеры / грануляция
+            for i in 0..<180 {
+                let cx = CGFloat(((i * 97 + seed) % w))
+                let cy = CGFloat(((i * 53 + seed * 3) % (h - 36)) + 18)
+                let rw = CGFloat(((i * 29) % 58) + 14)
+                let rh = CGFloat(((i * 19) % 34) + 10)
+                ctx.setFillColor(c2.withAlphaComponent(0.72).cgColor)
+                ctx.fillEllipse(in: CGRect(x: cx - rw * 0.5, y: cy - rh * 0.5, width: rw, height: rh))
+            }
+            // Полярные ледяные шапки для Земли и Марса
+            if body.id == "earth" || body.id == "mars" {
+                ctx.setFillColor(UIColor(white: 0.96, alpha: 0.92).cgColor)
+                ctx.fill(CGRect(x: 0, y: 0, width: w, height: 16))
+                ctx.fill(CGRect(x: 0, y: h - 16, width: w, height: 16))
+            }
         }
+        let img = UIGraphicsGetImageFromCurrentImageContext() ?? UIImage()
+        UIGraphicsEndImageContext()
+        return img
+    }
+
+    private func generateCloudTexture(seed: Int) -> UIImage {
+        let w = 512, h = 256
+        UIGraphicsBeginImageContextWithOptions(CGSize(width: w, height: h), false, 1.0)
+        guard let ctx = UIGraphicsGetCurrentContext() else { return UIImage() }
+        ctx.clear(CGRect(x: 0, y: 0, width: w, height: h))
+        let s = abs(seed)
+        for i in 0..<220 {
+            let x = CGFloat((i * 131 + s) % w)
+            let y = CGFloat((i * 71 + s) % h)
+            let rw = CGFloat((i % 46) + 18)
+            let rh = CGFloat((i % 14) + 6)
+            ctx.setFillColor(UIColor(white: 1.0, alpha: 0.34).cgColor)
+            ctx.fillEllipse(in: CGRect(x: x, y: y, width: rw, height: rh))
+        }
+        let img = UIGraphicsGetImageFromCurrentImageContext() ?? UIImage()
+        UIGraphicsEndImageContext()
+        return img
+    }
+
+    private func generateRingTexture(isBlackHole: Bool) -> UIImage {
+        let size = 256
+        UIGraphicsBeginImageContextWithOptions(CGSize(width: size, height: size), false, 1.0)
+        guard let ctx = UIGraphicsGetCurrentContext() else { return UIImage() }
+        let center = CGPoint(x: size / 2, y: size / 2)
+        for r in 65..<126 {
+            if !isBlackHole && (r == 98 || r == 99 || r == 114) { continue } // Щель Кассини
+            let alpha = isBlackHole ? CGFloat(126 - r) / 65.0 : CGFloat((r % 7) + 3) / 14.0
+            let col = isBlackHole
+                ? UIColor(red: 1.0, green: 0.62, blue: 0.18, alpha: alpha)
+                : UIColor(red: 0.88, green: 0.79, blue: 0.60, alpha: alpha)
+            ctx.setStrokeColor(col.cgColor)
+            ctx.setLineWidth(1.2)
+            ctx.addArc(center: center, radius: CGFloat(r), startAngle: 0, endAngle: .pi * 2, clockwise: false)
+            ctx.strokePath()
+        }
+        let img = UIGraphicsGetImageFromCurrentImageContext() ?? UIImage()
+        UIGraphicsEndImageContext()
+        return img
     }
 
     func rotateShip(yawDelta: Double, pitchDelta: Double) {
@@ -211,7 +455,6 @@ final class SpaceSimulationController: ObservableObject {
         rotateShip(yawDelta: 0, pitchDelta: 0)
     }
 
-    /// Главный цикл физики 1:1 и Floating Origin
     func stepSimulation(currentTime: TimeInterval) {
         if lastUpdateTime == 0 { lastUpdateTime = currentTime }
         let dt = min(0.05, currentTime - lastUpdateTime)
@@ -221,13 +464,24 @@ final class SpaceSimulationController: ObservableObject {
         let forwardVec = shipOrientation.act(SIMD3<Double>(0, 0, -1))
         shipPositionMeters += forwardVec * currentSpeed * dt
 
-        // Плавающее начало координат: корабль всегда в (0,0,0), мир сдвигается относительно него
+        // Анимация факелов двигателей от тяги
+        let flameScale = Float(max(0.05, throttle * (1.0 + Double(speedIndex) * 0.25)))
+        for fNode in exhaustNodes {
+            fNode.scale = SCNVector3(1.0, flameScale, 1.0)
+            fNode.isHidden = throttle <= 0.01
+        }
+
+        // Направление солнечного света из центра системы (0,0,0) к позиции корабля
+        let sunDir = simd_normalize(shipPositionMeters)
+        let fDir = SIMD3<Float>(Float(sunDir.x), Float(sunDir.y), Float(sunDir.z))
+        sunLightNode.simdLook(at: fDir, up: SIMD3<Float>(0, 1, 0), localFront: SIMD3<Float>(0, 0, -1))
+
+        // Floating Origin + логарифмическое масштабирование 1:1
         for body in UniverseCatalog.bodies {
             guard let node = bodyNodes[body.id] else { continue }
             let rel = body.positionMeters - shipPositionMeters
             let dist = simd_length(rel)
 
-            // Логарифмическое сжатие дальних дистанций для отображения в 32-битном z-буфере без потери масштаба 1:1
             let maxRenderDist = 450_000.0
             let scaleFactor = dist > maxRenderDist ? (maxRenderDist / dist) : 1.0
             let renderPos = rel * scaleFactor
@@ -236,21 +490,16 @@ final class SpaceSimulationController: ObservableObject {
             node.simdPosition = SIMD3<Float>(Float(renderPos.x), Float(renderPos.y), Float(renderPos.z))
             node.simdScale = SIMD3<Float>(repeating: Float(renderRadius))
 
-            if body.id == "sun" {
-                sunLightNode.simdPosition = node.simdPosition
+            if let cNode = cloudNodes[body.id] {
+                cNode.eulerAngles.y += Float(dt * 0.015)
             }
         }
 
-        // Телеметрия до выбранной цели
         let targetRel = targetBody.positionMeters - shipPositionMeters
         let surfaceDist = max(0, simd_length(targetRel) - targetBody.radiusMeters)
         DispatchQueue.main.async {
             self.distanceText = Self.formatDistance(surfaceDist)
-            if currentSpeed > 1.0 {
-                self.etaText = Self.formatTime(surfaceDist / currentSpeed)
-            } else {
-                self.etaText = "Стоп"
-            }
+            self.etaText = currentSpeed > 1.0 ? Self.formatTime(surfaceDist / currentSpeed) : "Стоп"
         }
     }
 
@@ -325,7 +574,6 @@ struct ContentView: View {
             SceneViewContainer(sim: sim)
 
             VStack {
-                // Компактная верхняя панель HUD
                 HStack(spacing: 10) {
                     Button(action: { showCatalog.toggle() }) {
                         HStack(spacing: 6) {
@@ -334,15 +582,16 @@ struct ContentView: View {
                                 .font(.system(size: 13, weight: .semibold, design: .monospaced))
                         }
                         .padding(.horizontal, 12).padding(.vertical, 8)
-                        .background(.ultraThinMaterial)
+                        .background(Color.black.opacity(0.68))
+                        .overlay(Capsule().stroke(Color.cyan.opacity(0.45), lineWidth: 1))
                         .clipShape(Capsule())
                     }
 
                     Text("ETA: \(sim.etaText)")
-                        .font(.system(size: 12, weight: .medium, design: .monospaced))
+                        .font(.system(size: 12, weight: .semibold, design: .monospaced))
                         .foregroundColor(.cyan)
                         .padding(.horizontal, 10).padding(.vertical, 8)
-                        .background(.ultraThinMaterial)
+                        .background(Color.black.opacity(0.68))
                         .clipShape(Capsule())
 
                     Spacer()
@@ -350,7 +599,7 @@ struct ContentView: View {
                     Button("На цель") { sim.alignToTarget() }
                         .font(.system(size: 12, weight: .bold))
                         .padding(.horizontal, 10).padding(.vertical, 8)
-                        .background(.blue.opacity(0.75))
+                        .background(Color.blue.opacity(0.8))
                         .clipShape(Capsule())
 
                     Button(sim.isThirdPerson ? "1-е лицо" : "3-е лицо") {
@@ -359,7 +608,8 @@ struct ContentView: View {
                     }
                     .font(.system(size: 12, weight: .bold))
                     .padding(.horizontal, 10).padding(.vertical, 8)
-                    .background(.ultraThinMaterial)
+                    .background(Color.black.opacity(0.68))
+                    .overlay(Capsule().stroke(Color.white.opacity(0.25), lineWidth: 1))
                     .clipShape(Capsule())
                 }
                 .foregroundColor(.white)
@@ -368,7 +618,6 @@ struct ContentView: View {
 
                 Spacer()
 
-                // Нижний блок управления тягой и ступенями FSD
                 HStack(alignment: .bottom) {
                     VStack(alignment: .leading, spacing: 6) {
                         Text("ТЯГА: \(Int(sim.throttle * 100))%")
@@ -379,7 +628,8 @@ struct ContentView: View {
                             .tint(.cyan)
                     }
                     .padding(10)
-                    .background(.ultraThinMaterial)
+                    .background(Color.black.opacity(0.68))
+                    .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.white.opacity(0.2), lineWidth: 1))
                     .cornerRadius(14)
 
                     Spacer()
@@ -387,7 +637,7 @@ struct ContentView: View {
                     HStack(spacing: 8) {
                         Button("−") { sim.speedIndex = max(0, sim.speedIndex - 1) }
                             .frame(width: 34, height: 34)
-                            .background(.ultraThinMaterial)
+                            .background(Color.white.opacity(0.14))
                             .clipShape(Circle())
 
                         Text(sim.speedSteps[sim.speedIndex].label)
@@ -396,18 +646,19 @@ struct ContentView: View {
 
                         Button("+") { sim.speedIndex = min(sim.speedSteps.count - 1, sim.speedIndex + 1) }
                             .frame(width: 34, height: 34)
-                            .background(.ultraThinMaterial)
+                            .background(Color.white.opacity(0.14))
                             .clipShape(Circle())
 
                         Button("СТОП") { sim.throttle = 0 }
                             .font(.system(size: 12, weight: .bold))
                             .padding(.horizontal, 12).padding(.vertical, 8)
-                            .background(.red.opacity(0.75))
+                            .background(Color.red.opacity(0.8))
                             .clipShape(Capsule())
                     }
                     .foregroundColor(.white)
                     .padding(8)
-                    .background(.ultraThinMaterial)
+                    .background(Color.black.opacity(0.68))
+                    .overlay(Capsule().stroke(Color.white.opacity(0.2), lineWidth: 1))
                     .clipShape(Capsule())
                 }
                 .padding(.horizontal, 16)
@@ -445,7 +696,8 @@ struct ContentView: View {
                 .foregroundColor(.white)
                 .padding()
                 .frame(maxWidth: 360, maxHeight: 280)
-                .background(.ultraThickMaterial)
+                .background(Color.black.opacity(0.88))
+                .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.cyan.opacity(0.4), lineWidth: 1))
                 .cornerRadius(16)
             }
         }
