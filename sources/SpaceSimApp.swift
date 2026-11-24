@@ -63,11 +63,14 @@ final class SpaceSimulationController: ObservableObject {
     @Published var isTimeReversed: Bool = false
     @Published var showOrbits: Bool = true
     @Published var showMarkers: Bool = true
+    @Published var isFreeCamera: Bool = false
+    @Published var autoSpeed: Bool = false
     @Published var throttle: Double = 0.0
     @Published var flightAssist: Bool = true
     @Published var targetBody: CelestialBody = UniverseCatalog.bodies[3]
     @Published var distanceText: String = "10.2 тыс. км"
     @Published var speedText: String = "0 м/с"
+    @Published var autoSpeedLabel: String = "АВТО"
     @Published var etaText: String = "Стоп"
     @Published var simDateText: String = ""
     @Published var screenMarkers: [BodyScreenMarker] = []
@@ -315,21 +318,18 @@ final class SpaceSimulationController: ObservableObject {
         }
     }
 
-    /// Преобразование 64-битных мировых координат в 3D-позицию сцены без Z-fighting
     private func compressToScene(_ relMeters: SIMD3<Double>) -> (pos: SIMD3<Float>, scaleFactor: Double) {
         let dist = simd_length(relMeters)
         let maxRenderDist = 420_000.0
         if dist <= maxRenderDist || dist < 1e-6 {
             return (SIMD3<Float>(Float(relMeters.x), Float(relMeters.y), Float(relMeters.z)), 1.0)
         }
-        // Плавное логарифмическое смещение глубины, чтобы далёкие звёзды всегда были позади ближних планет
         let compressedDist = maxRenderDist * (1.0 + 0.045 * log10(dist / maxRenderDist))
         let scaleFactor = compressedDist / dist
         let rPos = relMeters * scaleFactor
         return (SIMD3<Float>(Float(rPos.x), Float(rPos.y), Float(rPos.z)), scaleFactor)
     }
 
-    /// Обновление 3D-линий орбит всех планет и Луны в одном батче
     private func updateOrbitLines() {
         orbitLinesNode.isHidden = !showOrbits
         guard showOrbits else { return }
@@ -936,17 +936,37 @@ final class SpaceSimulationController: ObservableObject {
         }
     }
 
+    func toggleFreeCamera() {
+        isFreeCamera.toggle()
+        if isFreeCamera {
+            autoSpeed = true
+            throttle = 0
+            shipVelocityMetersPerSec = .zero
+            angularVelYaw = 0
+            angularVelPitch = 0
+        }
+        updateCameraMode()
+    }
+
     func updateCameraMode() {
-        thirdPersonMeshNode.isHidden = !isThirdPerson
-        cockpitMeshNode.isHidden = isThirdPerson
-        if isThirdPerson {
-            cameraBoomNode.eulerAngles = SCNVector3(orbitPitch + cameraLagPitch, orbitYaw + cameraLagYaw, 0)
-            cameraNode.position = SCNVector3(0, 0, orbitDistance)
-            cameraNode.eulerAngles = SCNVector3(0, 0, 0)
-        } else {
+        if isFreeCamera {
+            thirdPersonMeshNode.isHidden = true
+            cockpitMeshNode.isHidden = true
             cameraBoomNode.eulerAngles = SCNVector3(0, 0, 0)
             cameraNode.position = SCNVector3(0, 0, 0)
             cameraNode.eulerAngles = SCNVector3(0, 0, 0)
+        } else {
+            thirdPersonMeshNode.isHidden = !isThirdPerson
+            cockpitMeshNode.isHidden = isThirdPerson
+            if isThirdPerson {
+                cameraBoomNode.eulerAngles = SCNVector3(orbitPitch + cameraLagPitch, orbitYaw + cameraLagYaw, 0)
+                cameraNode.position = SCNVector3(0, 0, orbitDistance)
+                cameraNode.eulerAngles = SCNVector3(0, 0, 0)
+            } else {
+                cameraBoomNode.eulerAngles = SCNVector3(0, 0, 0)
+                cameraNode.position = SCNVector3(0, 0, 0)
+                cameraNode.eulerAngles = SCNVector3(0, 0, 0)
+            }
         }
     }
 
@@ -1061,7 +1081,12 @@ final class SpaceSimulationController: ObservableObject {
     }
 
     func handleCameraOrbitDrag(dx: Double, dy: Double) {
-        if isThirdPerson {
+        if isFreeCamera {
+            // В свободной камере SpaceEngine свайп по экрану плавно поворачивает взгляд
+            let qYaw = simd_quatd(angle: -dx * 0.0045, axis: SIMD3(0, 1, 0))
+            let qPitch = simd_quatd(angle: -dy * 0.0045, axis: SIMD3(1, 0, 0))
+            shipOrientation = simd_normalize(shipOrientation * qYaw * qPitch)
+        } else if isThirdPerson {
             orbitYaw -= Float(dx * 0.006)
             orbitPitch = max(-1.35, min(1.35, orbitPitch - Float(dy * 0.006)))
             updateCameraMode()
@@ -1117,16 +1142,66 @@ final class SpaceSimulationController: ObservableObject {
         let simDt = realDt * warp
         simulationTimeSeconds += simDt
 
-        let targetYawRate = -Double(stickInput.x) * 1.45
-        let targetPitchRate = -Double(stickInput.y) * 1.15
-        let damp = min(1.0, realDt * 6.5)
-        angularVelYaw += (targetYawRate - angularVelYaw) * damp
-        angularVelPitch += (targetPitchRate - angularVelPitch) * damp
+        // Расчёт ближайшей поверхности для логарифмической авто-скорости SpaceEngine
+        var nearestSurfaceDist = Double.greatestFiniteMagnitude
+        for body in UniverseCatalog.bodies {
+            let bodyPos = body.currentPosition(simulationTime: simulationTimeSeconds, allBodies: UniverseCatalog.bodies)
+            let d = max(10.0, simd_length(bodyPos - shipPositionMeters) - body.radiusMeters)
+            if d < nearestSurfaceDist { nearestSurfaceDist = d }
+        }
+        let autoMaxSpeedMps = max(50.0, nearestSurfaceDist * 0.45)
+        let effectiveMaxSpeed = autoSpeed ? autoMaxSpeedMps : speedSteps[speedIndex].mps
 
-        if abs(angularVelYaw) > 0.0001 || abs(angularVelPitch) > 0.0001 {
-            let qYaw = simd_quatd(angle: angularVelYaw * realDt, axis: SIMD3(0, 1, 0))
-            let qPitch = simd_quatd(angle: angularVelPitch * realDt, axis: SIMD3(1, 0, 0))
-            shipOrientation = simd_normalize(shipOrientation * qYaw * qPitch)
+        let forwardVec = shipOrientation.act(SIMD3<Double>(0, 0, -1))
+        let rightVec = shipOrientation.act(SIMD3<Double>(1, 0, 0))
+
+        if isFreeCamera {
+            // В свободной камере левый джойстик — это полёт вперёд/назад и стрейф (WASD)
+            let moveForward = -Double(stickInput.y) + throttle
+            let moveStrafe = Double(stickInput.x)
+            let desiredVelocity = (forwardVec * moveForward + rightVec * moveStrafe) * effectiveMaxSpeed
+            let response = min(1.0, realDt * 6.0)
+            shipVelocityMetersPerSec += (desiredVelocity - shipVelocityMetersPerSec) * response
+
+            shipVisualNode.eulerAngles = SCNVector3(0, 0, 0)
+        } else {
+            let targetYawRate = -Double(stickInput.x) * 1.45
+            let targetPitchRate = -Double(stickInput.y) * 1.15
+            let damp = min(1.0, realDt * 6.5)
+            angularVelYaw += (targetYawRate - angularVelYaw) * damp
+            angularVelPitch += (targetPitchRate - angularVelPitch) * damp
+
+            if abs(angularVelYaw) > 0.0001 || abs(angularVelPitch) > 0.0001 {
+                let qYaw = simd_quatd(angle: angularVelYaw * realDt, axis: SIMD3(0, 1, 0))
+                let qPitch = simd_quatd(angle: angularVelPitch * realDt, axis: SIMD3(1, 0, 0))
+                shipOrientation = simd_normalize(shipOrientation * qYaw * qPitch)
+            }
+
+            let desiredBank = Float(angularVelYaw * 0.35)
+            let desiredPitchVis = Float(angularVelPitch * 0.18)
+            shipVisualNode.eulerAngles.z += (desiredBank - shipVisualNode.eulerAngles.z) * Float(min(1.0, realDt * 8.0))
+            shipVisualNode.eulerAngles.x += (desiredPitchVis - shipVisualNode.eulerAngles.x) * Float(min(1.0, realDt * 8.0))
+
+            let targetStickX = Float(stickInput.y * 0.32)
+            let targetStickZ = Float(-stickInput.x * 0.32)
+            cockpitStickPivot.eulerAngles.x += (targetStickX - cockpitStickPivot.eulerAngles.x) * Float(min(1.0, realDt * 12.0))
+            cockpitStickPivot.eulerAngles.z += (targetStickZ - cockpitStickPivot.eulerAngles.z) * Float(min(1.0, realDt * 12.0))
+            let targetThrottleAngle = Float(0.35 - throttle * 0.78)
+            cockpitThrottlePivot.eulerAngles.x += (targetThrottleAngle - cockpitThrottlePivot.eulerAngles.x) * Float(min(1.0, realDt * 10.0))
+
+            cameraLagYaw += (Float(-angularVelYaw * 0.14) - cameraLagYaw) * Float(min(1.0, realDt * 5.0))
+            cameraLagPitch += (Float(-angularVelPitch * 0.10) - cameraLagPitch) * Float(min(1.0, realDt * 5.0))
+            if isThirdPerson {
+                cameraBoomNode.eulerAngles = SCNVector3(orbitPitch + cameraLagPitch, orbitYaw + cameraLagYaw, 0)
+            }
+
+            let desiredVelocity = forwardVec * (effectiveMaxSpeed * throttle)
+            if flightAssist {
+                let response = min(1.0, realDt * 3.5)
+                shipVelocityMetersPerSec += (desiredVelocity - shipVelocityMetersPerSec) * response
+            } else if throttle > 0.001 {
+                shipVelocityMetersPerSec += forwardVec * (effectiveMaxSpeed * throttle * 0.25) * realDt
+            }
         }
 
         shipNode.simdOrientation = simd_quatf(
@@ -1136,37 +1211,7 @@ final class SpaceSimulationController: ObservableObject {
             r: Float(shipOrientation.real)
         )
 
-        let desiredBank = Float(angularVelYaw * 0.35)
-        let desiredPitchVis = Float(angularVelPitch * 0.18)
-        shipVisualNode.eulerAngles.z += (desiredBank - shipVisualNode.eulerAngles.z) * Float(min(1.0, realDt * 8.0))
-        shipVisualNode.eulerAngles.x += (desiredPitchVis - shipVisualNode.eulerAngles.x) * Float(min(1.0, realDt * 8.0))
-
-        let targetStickX = Float(stickInput.y * 0.32)
-        let targetStickZ = Float(-stickInput.x * 0.32)
-        cockpitStickPivot.eulerAngles.x += (targetStickX - cockpitStickPivot.eulerAngles.x) * Float(min(1.0, realDt * 12.0))
-        cockpitStickPivot.eulerAngles.z += (targetStickZ - cockpitStickPivot.eulerAngles.z) * Float(min(1.0, realDt * 12.0))
-        let targetThrottleAngle = Float(0.35 - throttle * 0.78)
-        cockpitThrottlePivot.eulerAngles.x += (targetThrottleAngle - cockpitThrottlePivot.eulerAngles.x) * Float(min(1.0, realDt * 10.0))
-
-        cameraLagYaw += (Float(-angularVelYaw * 0.14) - cameraLagYaw) * Float(min(1.0, realDt * 5.0))
-        cameraLagPitch += (Float(-angularVelPitch * 0.10) - cameraLagPitch) * Float(min(1.0, realDt * 5.0))
-        if isThirdPerson {
-            cameraBoomNode.eulerAngles = SCNVector3(orbitPitch + cameraLagPitch, orbitYaw + cameraLagYaw, 0)
-        }
-
-        let targetSpeed = speedSteps[speedIndex].mps * throttle
-        let forwardVec = shipOrientation.act(SIMD3<Double>(0, 0, -1))
-        let desiredVelocity = forwardVec * targetSpeed
-
-        if flightAssist {
-            let response = min(1.0, realDt * 3.5)
-            shipVelocityMetersPerSec += (desiredVelocity - shipVelocityMetersPerSec) * response
-        } else if throttle > 0.001 {
-            shipVelocityMetersPerSec += forwardVec * (speedSteps[speedIndex].mps * throttle * 0.25) * realDt
-        }
-
-        // Корабль может летать даже на паузе времени Вселенной (как свободный полёт в SpaceEngine)
-        let flightDt = isTimePaused ? realDt : (realDt * max(1.0, abs(warp)))
+        let flightDt = (isTimePaused || isFreeCamera) ? realDt : (realDt * max(1.0, abs(warp)))
         shipPositionMeters += shipVelocityMetersPerSec * flightDt
         let actualSpeed = simd_length(shipVelocityMetersPerSec)
 
@@ -1187,7 +1232,7 @@ final class SpaceSimulationController: ObservableObject {
         let flameScale = Float(max(0.05, throttle * (1.0 + Double(speedIndex) * 0.22)))
         for fNode in exhaustNodes {
             fNode.scale = SCNVector3(1.0, flameScale, 1.0)
-            fNode.isHidden = throttle <= 0.01
+            fNode.isHidden = throttle <= 0.01 || isFreeCamera
         }
 
         let sunDirWorld = simd_normalize(-shipPositionMeters)
@@ -1230,7 +1275,6 @@ final class SpaceSimulationController: ObservableObject {
                 atmoMaterials[body.id]?.setValue(NSValue(scnVector3: SCNVector3(sunView.x, sunView.y, sunView.z)), forKey: "sunDirView")
             }
 
-            // Проецируем 3D-позицию тела на экран для интерактивной метки SpaceEngine
             if showMarkers {
                 let projected = renderer.projectPoint(node.position)
                 if projected.z > 0.0 && projected.z < 1.0 {
@@ -1252,7 +1296,6 @@ final class SpaceSimulationController: ObservableObject {
             }
         }
 
-        // Обновляем 3D-линии орбит каждые 2 кадра (30 Гц — плавно и без нагрузки на батарею)
         if frameCounter % 2 == 0 {
             updateOrbitLines()
         }
@@ -1260,10 +1303,12 @@ final class SpaceSimulationController: ObservableObject {
         let targetPos = targetBody.currentPosition(simulationTime: simulationTimeSeconds, allBodies: UniverseCatalog.bodies)
         let surfaceDist = max(0, simd_length(targetPos - shipPositionMeters) - targetBody.radiusMeters)
         let currentDateStr = Self.dateFormatter.string(from: baseEpochDate.addingTimeInterval(simulationTimeSeconds))
+        let autoSpeedStr = Self.formatSpeed(autoMaxSpeedMps)
 
         DispatchQueue.main.async {
             self.distanceText = Self.formatDistance(surfaceDist)
             self.speedText = Self.formatSpeed(actualSpeed)
+            self.autoSpeedLabel = autoSpeedStr
             self.etaText = actualSpeed > 1.0 ? Self.formatTime(surfaceDist / actualSpeed) : "Стоп"
             self.simDateText = currentDateStr
             self.screenMarkers = self.showMarkers ? newMarkers : []
@@ -1283,7 +1328,11 @@ final class SpaceSimulationController: ObservableObject {
         if mps < 1_000 { return String(format: "%.0f м/с", mps) }
         let kms = mps / 1_000
         if kms < 100_000 { return String(format: "%.1f км/с", kms) }
-        return String(format: "%.2f c", mps / 299_792_458.0)
+        let c = mps / 299_792_458.0
+        if c < 10_000 { return String(format: "%.2f c", c) }
+        let lys = mps / UniverseCatalog.ly
+        if lys >= 0.01 { return String(format: "%.2f св.л/с", lys) }
+        return String(format: "%.0f тыс. c", c / 1_000)
     }
 
     static func formatTime(_ sec: Double) -> String {
@@ -1312,6 +1361,7 @@ final class SpaceSimulationController: ObservableObject {
 }
 
 struct VirtualFlightStick: View {
+    var label: String = ""
     var onChange: (CGPoint) -> Void
     @State private var knobOffset: CGSize = .zero
     private let maxRadius: CGFloat = 38
@@ -1322,6 +1372,13 @@ struct VirtualFlightStick: View {
                 .fill(Color.black.opacity(0.45))
                 .overlay(Circle().stroke(Color.cyan.opacity(0.45), lineWidth: 1.5))
                 .frame(width: 96, height: 96)
+
+            if !label.isEmpty {
+                Text(label)
+                    .font(.system(size: 8, weight: .bold, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.45))
+                    .offset(y: -30)
+            }
 
             Circle()
                 .fill(Color.cyan.opacity(0.85))
@@ -1387,7 +1444,7 @@ struct SceneViewContainer: UIViewRepresentable {
         }
 
         @objc func handlePinch(_ gesture: UIPinchGestureRecognizer) {
-            if sim.isThirdPerson {
+            if sim.isThirdPerson && !sim.isFreeCamera {
                 sim.orbitDistance = max(6.5, min(45.0, sim.orbitDistance / Float(gesture.scale)))
                 sim.updateCameraMode()
                 gesture.scale = 1.0
@@ -1405,7 +1462,6 @@ struct ContentView: View {
         ZStack {
             SceneViewContainer(sim: sim)
 
-            // Слой интерактивных 3D-меток SpaceEngine (тап по метке выбирает объект целью)
             if sim.showMarkers {
                 ForEach(sim.screenMarkers) { marker in
                     Button(action: {
@@ -1491,15 +1547,27 @@ struct ContentView: View {
                         .background(Color.blue.opacity(0.82))
                         .clipShape(Capsule())
 
-                    Button(sim.isThirdPerson ? "1-е лицо" : "3-е лицо") {
-                        sim.isThirdPerson.toggle()
-                        sim.updateCameraMode()
+                    // Переключатель SpaceEngine: Свободная камера / Корабль
+                    Button(action: { sim.toggleFreeCamera() }) {
+                        Text(sim.isFreeCamera ? "Корабль" : "Камера")
+                            .font(.system(size: 10, weight: .bold))
+                            .padding(.horizontal, 9).padding(.vertical, 6)
+                            .background(sim.isFreeCamera ? Color.orange.opacity(0.82) : Color.black.opacity(0.72))
+                            .overlay(Capsule().stroke(Color.white.opacity(0.25), lineWidth: 1))
+                            .clipShape(Capsule())
                     }
-                    .font(.system(size: 10, weight: .bold))
-                    .padding(.horizontal, 9).padding(.vertical, 6)
-                    .background(Color.black.opacity(0.72))
-                    .overlay(Capsule().stroke(Color.white.opacity(0.25), lineWidth: 1))
-                    .clipShape(Capsule())
+
+                    if !sim.isFreeCamera {
+                        Button(sim.isThirdPerson ? "1-е лицо" : "3-е лицо") {
+                            sim.isThirdPerson.toggle()
+                            sim.updateCameraMode()
+                        }
+                        .font(.system(size: 10, weight: .bold))
+                        .padding(.horizontal, 9).padding(.vertical, 6)
+                        .background(Color.black.opacity(0.72))
+                        .overlay(Capsule().stroke(Color.white.opacity(0.25), lineWidth: 1))
+                        .clipShape(Capsule())
+                    }
                 }
                 .foregroundColor(.white)
                 .padding(.horizontal, 12)
@@ -1508,23 +1576,25 @@ struct ContentView: View {
                 Spacer()
 
                 HStack(alignment: .bottom, spacing: 10) {
-                    VirtualFlightStick { pt in
+                    VirtualFlightStick(label: sim.isFreeCamera ? "WASD" : "РУЛЬ") { pt in
                         sim.stickInput = pt
                     }
 
                     VStack(alignment: .leading, spacing: 5) {
                         HStack {
-                            Text("ТЯГА: \(Int(sim.throttle * 100))%")
+                            Text(sim.isFreeCamera ? "КРУИЗ: \(Int(sim.throttle * 100))%" : "ТЯГА: \(Int(sim.throttle * 100))%")
                                 .font(.system(size: 10, weight: .bold, design: .monospaced))
                                 .foregroundColor(.cyan)
                             Spacer()
-                            Button(sim.flightAssist ? "FA: ON" : "ИНЕРЦИЯ") {
-                                sim.flightAssist.toggle()
+                            if !sim.isFreeCamera {
+                                Button(sim.flightAssist ? "FA: ON" : "ИНЕРЦИЯ") {
+                                    sim.flightAssist.toggle()
+                                }
+                                .font(.system(size: 9, weight: .bold, design: .monospaced))
+                                .padding(.horizontal, 6).padding(.vertical, 2)
+                                .background(sim.flightAssist ? Color.green.opacity(0.35) : Color.orange.opacity(0.5))
+                                .cornerRadius(6)
                             }
-                            .font(.system(size: 9, weight: .bold, design: .monospaced))
-                            .padding(.horizontal, 6).padding(.vertical, 2)
-                            .background(sim.flightAssist ? Color.green.opacity(0.35) : Color.orange.opacity(0.5))
-                            .cornerRadius(6)
                         }
                         Slider(value: $sim.throttle, in: 0...1)
                             .frame(width: 140)
@@ -1538,7 +1608,6 @@ struct ContentView: View {
                     Spacer()
 
                     VStack(alignment: .trailing, spacing: 5) {
-                        // Часы Вселенной: дата, реверс, пауза и масштаб времени
                         HStack(spacing: 5) {
                             Text(sim.simDateText)
                                 .font(.system(size: 10, weight: .semibold, design: .monospaced))
@@ -1549,7 +1618,7 @@ struct ContentView: View {
                                 Image(systemName: sim.isTimeReversed ? "backward.fill" : "forward.fill")
                                     .font(.system(size: 10))
                                     .frame(width: 24, height: 24)
-                                    .background(sim.isTimeReversed ? Color.orange.opacity(0.65) : Color.white.opacity(0.14))
+                                    .background(sim.isTimeReversed ? Color.orange.opacity(0.65) : Color.white.opacity(0.18))
                                     .clipShape(Circle())
                             }
 
@@ -1557,24 +1626,32 @@ struct ContentView: View {
                                 Image(systemName: sim.isTimePaused ? "play.fill" : "pause.fill")
                                     .font(.system(size: 10))
                                     .frame(width: 24, height: 24)
-                                    .background(sim.isTimePaused ? Color.red.opacity(0.65) : Color.white.opacity(0.14))
+                                    .background(sim.isTimePaused ? Color.red.opacity(0.65) : Color.white.opacity(0.18))
                                     .clipShape(Circle())
                             }
 
-                            Button("−") { sim.timeWarpIndex = max(0, sim.timeWarpIndex - 1) }
-                                .frame(width: 24, height: 24)
-                                .background(Color.white.opacity(0.14))
-                                .clipShape(Circle())
+                            Button(action: { sim.timeWarpIndex = max(0, sim.timeWarpIndex - 1) }) {
+                                Text("−")
+                                    .font(.system(size: 14, weight: .bold))
+                                    .foregroundColor(.white)
+                                    .frame(width: 24, height: 24)
+                                    .background(Color.white.opacity(0.18))
+                                    .clipShape(Circle())
+                            }
 
                             Text(sim.isTimePaused ? "ПАУЗА" : "\(sim.isTimeReversed ? "−" : "")\(sim.timeWarpSteps[sim.timeWarpIndex].label)")
                                 .font(.system(size: 10, weight: .bold, design: .monospaced))
                                 .foregroundColor(.yellow)
                                 .frame(minWidth: 46)
 
-                            Button("+") { sim.timeWarpIndex = min(sim.timeWarpSteps.count - 1, sim.timeWarpIndex + 1) }
-                                .frame(width: 24, height: 24)
-                                .background(Color.white.opacity(0.14))
-                                .clipShape(Circle())
+                            Button(action: { sim.timeWarpIndex = min(sim.timeWarpSteps.count - 1, sim.timeWarpIndex + 1) }) {
+                                Text("+")
+                                    .font(.system(size: 14, weight: .bold))
+                                    .foregroundColor(.white)
+                                    .frame(width: 24, height: 24)
+                                    .background(Color.white.opacity(0.18))
+                                    .clipShape(Circle())
+                            }
                         }
                         .foregroundColor(.white)
                         .padding(.horizontal, 7).padding(.vertical, 5)
@@ -1582,20 +1659,40 @@ struct ContentView: View {
                         .overlay(Capsule().stroke(Color.white.opacity(0.2), lineWidth: 1))
                         .clipShape(Capsule())
 
-                        HStack(spacing: 7) {
-                            Button("−") { sim.speedIndex = max(0, sim.speedIndex - 1) }
-                                .frame(width: 28, height: 28)
-                                .background(Color.white.opacity(0.14))
-                                .clipShape(Circle())
+                        HStack(spacing: 6) {
+                            // Кнопка логарифмической авто-скорости SpaceEngine
+                            Button(action: { sim.autoSpeed.toggle() }) {
+                                Text("АВТО")
+                                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                    .padding(.horizontal, 8).padding(.vertical, 6)
+                                    .background(sim.autoSpeed ? Color.cyan.opacity(0.45) : Color.white.opacity(0.14))
+                                    .clipShape(Capsule())
+                            }
 
-                            Text(sim.speedSteps[sim.speedIndex].label)
+                            if !sim.autoSpeed {
+                                Button(action: { sim.speedIndex = max(0, sim.speedIndex - 1) }) {
+                                    Text("−")
+                                        .font(.system(size: 15, weight: .bold))
+                                        .frame(width: 28, height: 28)
+                                        .background(Color.white.opacity(0.18))
+                                        .clipShape(Circle())
+                                }
+                            }
+
+                            Text(sim.autoSpeed ? sim.autoSpeedLabel : sim.speedSteps[sim.speedIndex].label)
                                 .font(.system(size: 11, weight: .bold, design: .monospaced))
-                                .frame(minWidth: 88)
+                                .foregroundColor(sim.autoSpeed ? .cyan : .white)
+                                .frame(minWidth: 84)
 
-                            Button("+") { sim.speedIndex = min(sim.speedSteps.count - 1, sim.speedIndex + 1) }
-                                .frame(width: 28, height: 28)
-                                .background(Color.white.opacity(0.14))
-                                .clipShape(Circle())
+                            if !sim.autoSpeed {
+                                Button(action: { sim.speedIndex = min(sim.speedSteps.count - 1, sim.speedIndex + 1) }) {
+                                    Text("+")
+                                        .font(.system(size: 15, weight: .bold))
+                                        .frame(width: 28, height: 28)
+                                        .background(Color.white.opacity(0.18))
+                                        .clipShape(Circle())
+                                }
+                            }
 
                             Button("СТОП") {
                                 sim.throttle = 0
@@ -1617,7 +1714,6 @@ struct ContentView: View {
                 .padding(.bottom, 10)
             }
 
-            // Научная инфо-карточка объекта (SpaceEngine Wiki / Telemetry)
             if showInfo {
                 let b = sim.targetBody
                 VStack(alignment: .leading, spacing: 6) {
