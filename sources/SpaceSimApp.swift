@@ -51,7 +51,6 @@ final class SpaceSimulationController: ObservableObject {
     }
 
     private func setupScene() {
-        // Звёздное небо в фоне сцены — никакого белого экрана и обрезанных сфер[span_14](start_span)[span_14](end_span)[span_15](start_span)[span_15](end_span)
         scene.background.contents = generateStarSkybox()
 
         let sunLight = SCNLight()
@@ -106,7 +105,6 @@ final class SpaceSimulationController: ObservableObject {
             sphere.materials = [mat]
             root.addChildNode(SCNNode(geometry: sphere))
 
-            // Объёмное свечение атмосферы (Fresnel-ореол без резких границ)
             if body.hasAtmosphere && !body.isStar {
                 let atmoSphere = SCNSphere(radius: 1.038)
                 atmoSphere.segmentCount = 72
@@ -115,17 +113,16 @@ final class SpaceSimulationController: ObservableObject {
                 atmoMat.blendMode = .add
                 atmoMat.cullMode = .front
                 atmoMat.writesToDepthBuffer = false
-                let atmoVec = body.id == "mars" ? "float3(0.95, 0.45, 0.22)" : "float3(0.25, 0.62, 1.0)"
+                let atmoVec = body.id == "mars" ? "vec3(0.95, 0.45, 0.22)" : "vec3(0.25, 0.62, 1.0)"
                 atmoMat.shaderModifiers = [.fragment: """
                     float ndotv = abs(dot(normalize(_surface.normal), normalize(_surface.view)));
                     float rim = pow(1.0 - ndotv, 3.2);
-                    _output.color = float4(\(atmoVec) * rim * 0.85, rim);
+                    _output.color = vec4(\(atmoVec) * rim * 0.85, rim);
                 """]
                 atmoSphere.materials = [atmoMat]
                 root.addChildNode(SCNNode(geometry: atmoSphere))
             }
 
-            // Кольца Сатурна / аккреционный диск ЧД
             if body.hasRings {
                 let ring = SCNTube(innerRadius: 1.35, outerRadius: 2.35, height: 0.003)
                 let ringMat = SCNMaterial()
@@ -145,7 +142,7 @@ final class SpaceSimulationController: ObservableObject {
         }
     }
 
-    // Попиксельный процедурный Metal-шейдер для планет (фрактальные континенты, облака, пояса, кратеры)
+    // Нативный шейдер SceneKit (vec3/vec4) — без ошибки розовой заливки[span_14](start_span)[span_14](end_span)[span_15](start_span)[span_15](end_span)
     private func planetShaderModifier(for body: CelestialBody) -> String {
         let mode: Int
         switch body.id {
@@ -159,80 +156,74 @@ final class SpaceSimulationController: ObservableObject {
         let c2 = rgbComponents(body.secondaryHex)
 
         return """
-        float3 p = normalize(_surface.position) * 3.2;
-        // 5-октавный фрактальный 3D-шум (FBM)
+        vec3 p = normalize(_surface.position) * 3.2;
         float n = 0.0;
         float amp = 0.5;
-        float3 q = p;
+        vec3 q = p;
         for (int i = 0; i < 5; i++) {
             float s = sin(q.x * 2.1 + cos(q.y * 2.3 + sin(q.z * 2.5)));
             float c = cos(q.z * 2.2 + sin(q.x * 2.4 + cos(q.y * 2.0)));
             n += (s * c * 0.5 + 0.5) * amp;
-            q = q * 2.07 + float3(1.7, 9.2, 5.4);
+            q = q * 2.07 + vec3(1.7, 9.2, 5.4);
             amp *= 0.5;
         }
 
-        float3 col1 = float3(\(c1.r), \(c1.g), \(c1.b));
-        float3 col2 = float3(\(c2.r), \(c2.g), \(c2.b));
-        float3 albedo = col1;
+        vec3 col1 = vec3(\(c1.r), \(c1.g), \(c1.b));
+        vec3 col2 = vec3(\(c2.r), \(c2.g), \(c2.b));
+        vec3 albedo = col1;
         float rough = 0.85;
 
         int planetMode = \(mode);
         if (planetMode == 1) {
-            // Земля: глубокий океан, шельф, зелёные равнины, горы, полярные шапки и вихревые облака
             float lat = abs(normalize(_surface.position).y);
             if (lat + n * 0.15 > 0.86) {
-                albedo = float3(0.95, 0.97, 1.0);
+                albedo = vec3(0.95, 0.97, 1.0);
                 rough = 0.6;
             } else if (n < 0.49) {
                 float depth = clamp(n / 0.49, 0.0, 1.0);
-                albedo = mix(float3(0.02, 0.10, 0.32), float3(0.06, 0.34, 0.68), pow(depth, 1.4));
+                albedo = mix(vec3(0.02, 0.10, 0.32), vec3(0.06, 0.34, 0.68), pow(depth, 1.4));
                 rough = 0.18;
             } else {
                 float h = (n - 0.49) / 0.51;
-                float3 grass = float3(0.14, 0.42, 0.18);
-                float3 desert = float3(0.68, 0.58, 0.36);
-                float3 rock = float3(0.42, 0.40, 0.38);
+                vec3 grass = vec3(0.14, 0.42, 0.18);
+                vec3 desert = vec3(0.68, 0.58, 0.36);
+                vec3 rock = vec3(0.42, 0.40, 0.38);
                 albedo = mix(grass, desert, smoothstep(0.15, 0.45, h));
                 albedo = mix(albedo, rock, smoothstep(0.55, 0.85, h));
                 rough = 0.88;
             }
-            // Слой облаков с тенью
-            float3 cp = normalize(_surface.position) * 4.5 + float3(u_time * 0.015, 0.0, 0.0);
+            vec3 cp = normalize(_surface.position) * 4.5 + vec3(u_time * 0.015, 0.0, 0.0);
             float cn = 0.0;
             float camp = 0.55;
             for (int j = 0; j < 4; j++) {
                 cn += (sin(cp.x * 2.4 + cos(cp.y * 2.1 + cp.z * 2.3)) * 0.5 + 0.5) * camp;
-                cp = cp * 2.15 + float3(3.1, 1.4, 7.2);
+                cp = cp * 2.15 + vec3(3.1, 1.4, 7.2);
                 camp *= 0.5;
             }
             float clouds = smoothstep(0.56, 0.82, cn);
-            albedo = mix(albedo, float3(0.98, 0.99, 1.0), clouds * 0.88);
+            albedo = mix(albedo, vec3(0.98, 0.99, 1.0), clouds * 0.88);
             rough = mix(rough, 0.9, clouds);
         } else if (planetMode == 2) {
-            // Марс: пустыни, каньоны и полярные шапки
             float lat = abs(normalize(_surface.position).y);
             albedo = mix(col2, col1, smoothstep(0.32, 0.68, n));
-            if (lat + n * 0.1 > 0.88) albedo = float3(0.95, 0.94, 0.92);
+            if (lat + n * 0.1 > 0.88) albedo = vec3(0.95, 0.94, 0.92);
         } else if (planetMode == 3) {
-            // Газовые гиганты: турбулентные широтные полосы
             float yBand = normalize(_surface.position).y * 14.0 + n * 2.2;
             float stripe = sin(yBand) * 0.5 + 0.5;
             albedo = mix(col2, col1, smoothstep(0.2, 0.8, stripe));
             rough = 0.65;
         } else {
-            // Каменистые планеты и луны с микрорельефом
             albedo = mix(col2, col1, smoothstep(0.3, 0.72, n));
         }
 
-        _surface.diffuse = float4(albedo, 1.0);
+        _surface.diffuse = vec4(albedo, 1.0);
         _surface.roughness = rough;
         """
     }
 
     private func starShaderModifier() -> String {
         return """
-        float3 p = normalize(_surface.position) * 8.0 + float3(u_time * 0.15);
+        vec3 p = normalize(_surface.position) * 8.0 + vec3(u_time * 0.15);
         float gran = sin(p.x * 3.1 + cos(p.y * 3.3 + p.z * 3.5)) * 0.5 + 0.5;
         float ndotv = abs(dot(normalize(_surface.normal), normalize(_surface.view)));
         float limb = 0.55 + 0.45 * pow(ndotv, 0.55);
@@ -321,7 +312,6 @@ final class SpaceSimulationController: ObservableObject {
         neonOrange.lightingModel = .constant
         neonOrange.diffuse.contents = UIColor(red: 1.0, green: 0.52, blue: 0.12, alpha: 1.0)
 
-        // Наклонная приборная панель с подсветкой МФД-экранов[span_16](start_span)[span_16](end_span)
         let dash = SCNBox(width: 2.2, height: 0.36, length: 0.7, chamferRadius: 0.04)
         dash.materials = [frameMat]
         let dashNode = SCNNode(geometry: dash)
@@ -335,7 +325,6 @@ final class SpaceSimulationController: ObservableObject {
         trimNode.position = SCNVector3(0, -0.40, -0.60)
         cockpitMeshNode.addChildNode(trimNode)
 
-        // 3 светящихся МФД-экрана на панели
         for (idx, xPos) in [-0.42, 0.0, 0.42].enumerated() {
             let screen = SCNBox(width: 0.32, height: 0.14, length: 0.01, chamferRadius: 0.01)
             let sMat = SCNMaterial()
@@ -350,7 +339,6 @@ final class SpaceSimulationController: ObservableObject {
             cockpitMeshNode.addChildNode(scNode)
         }
 
-        // Боковые стойки фонаря с габаритными огнями
         for side in [-1.0, 1.0] {
             let strut = SCNBox(width: 0.04, height: 1.15, length: 0.04, chamferRadius: 0.01)
             strut.materials = [frameMat]
@@ -401,14 +389,20 @@ final class SpaceSimulationController: ObservableObject {
             ctx.setFillColor(UIColor(red: 0.01, green: 0.015, blue: 0.03, alpha: 1.0).cgColor)
             ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
 
-            // Млечный Путь
-            for i in 0..<3000 {
-                let x = CGFloat((i * 48271) % w)
+            var rng: UInt64 = 0x123456789ABCDEF
+            func nextRand() -> Double {
+                rng = rng &* 6364136223846793005 &+ 1442695040888963407
+                return Double(rng >> 33) / Double(1 << 31)
+            }
+
+            // Млечный Путь без регулярной сетки[span_16](start_span)[span_16](end_span)[span_17](start_span)[span_17](end_span)
+            for _ in 0..<3500 {
+                let x = CGFloat(nextRand() * Double(w))
                 let spread = sin(Double(x) / Double(w) * .pi * 2.0) * 140.0
-                let offset = Double((i * 16807) % 240) - 120.0
-                let y = CGFloat(Double(h) * 0.5 + spread + offset * 0.65)
-                ctx.setFillColor(UIColor(red: 0.60, green: 0.76, blue: 1.0, alpha: 0.07).cgColor)
-                ctx.fillEllipse(in: CGRect(x: x, y: y, width: 3.5, height: 3.5))
+                let offset = (nextRand() - 0.5) * 260.0
+                let y = CGFloat(Double(h) * 0.5 + spread + offset)
+                ctx.setFillColor(UIColor(red: 0.60, green: 0.76, blue: 1.0, alpha: 0.06).cgColor)
+                ctx.fillEllipse(in: CGRect(x: x, y: y, width: 4.0, height: 4.0))
             }
 
             let starColors: [UIColor] = [
@@ -417,11 +411,11 @@ final class SpaceSimulationController: ObservableObject {
                 UIColor(red: 1.0, green: 0.92, blue: 0.75, alpha: 1.0),
                 UIColor(red: 1.0, green: 0.72, blue: 0.55, alpha: 1.0)
             ]
-            for i in 0..<7000 {
-                let x = CGFloat((i * 73856093) % w)
-                let y = CGFloat((i * 19349663) % h)
-                let r = (i % 15 == 0) ? CGFloat(2.2) : CGFloat(1.1)
-                let alpha = CGFloat((i % 75) + 25) / 100.0
+            for i in 0..<8000 {
+                let x = CGFloat(nextRand() * Double(w))
+                let y = CGFloat(nextRand() * Double(h))
+                let r = (i % 18 == 0) ? CGFloat(2.2) : CGFloat(1.0 + nextRand() * 0.7)
+                let alpha = CGFloat(0.25 + nextRand() * 0.75)
                 ctx.setFillColor(starColors[i % starColors.count].withAlphaComponent(alpha).cgColor)
                 ctx.fillEllipse(in: CGRect(x: x, y: y, width: r, height: r))
             }
@@ -471,6 +465,15 @@ final class SpaceSimulationController: ObservableObject {
             shipOrientation = simd_quatd(angle: acos(max(-1.0, min(1.0, dot))), axis: axis)
         }
         rotateShip(yawDelta: 0, pitchDelta: 0)
+    }
+
+    /// Мгновенный варп-перелёт на орбиту выбранного объекта из каталога
+    func warpToBody(_ body: CelestialBody) {
+        targetBody = body
+        throttle = 0
+        let orbitDist = body.radiusMeters * 2.8
+        shipPositionMeters = body.positionMeters + SIMD3<Double>(orbitDist * 0.6, orbitDist * 0.25, orbitDist * 0.75)
+        alignToTarget()
     }
 
     func stepSimulation(currentTime: TimeInterval) {
@@ -695,27 +698,42 @@ struct ContentView: View {
                     ScrollView {
                         VStack(spacing: 6) {
                             ForEach(UniverseCatalog.bodies) { body in
-                                Button(action: {
-                                    sim.targetBody = body
-                                    showCatalog = false
-                                }) {
-                                    HStack {
+                                HStack(spacing: 8) {
+                                    VStack(alignment: .leading, spacing: 2) {
                                         Text(body.name).bold()
-                                        Spacer()
                                         Text(body.type).font(.caption).foregroundColor(.gray)
                                     }
-                                    .padding(10)
-                                    .background(Color.white.opacity(0.08))
+                                    Spacer()
+                                    Button("Курс") {
+                                        sim.targetBody = body
+                                        sim.alignToTarget()
+                                        showCatalog = false
+                                    }
+                                    .font(.caption.bold())
+                                    .padding(.horizontal, 10).padding(.vertical, 6)
+                                    .background(Color.white.opacity(0.15))
+                                    .cornerRadius(8)
+
+                                    Button("Перелёт") {
+                                        sim.warpToBody(body)
+                                        showCatalog = false
+                                    }
+                                    .font(.caption.bold())
+                                    .padding(.horizontal, 10).padding(.vertical, 6)
+                                    .background(Color.blue)
                                     .cornerRadius(8)
                                 }
+                                .padding(8)
+                                .background(Color.white.opacity(0.08))
+                                .cornerRadius(10)
                             }
                         }
                     }
                 }
                 .foregroundColor(.white)
                 .padding()
-                .frame(maxWidth: 360, maxHeight: 280)
-                .background(Color.black.opacity(0.88))
+                .frame(maxWidth: 380, maxHeight: 290)
+                .background(Color.black.opacity(0.9))
                 .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.cyan.opacity(0.4), lineWidth: 1))
                 .cornerRadius(16)
             }
