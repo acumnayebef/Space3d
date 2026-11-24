@@ -19,6 +19,8 @@ final class SpaceSimulationController: ObservableObject {
     let shipVisualNode = SCNNode()
     let thirdPersonMeshNode = SCNNode()
     let cockpitMeshNode = SCNNode()
+    let cockpitStickPivot = SCNNode()
+    let cockpitThrottlePivot = SCNNode()
     let cameraBoomNode = SCNNode()
     let cameraNode = SCNNode()
     let sunLightNode = SCNNode()
@@ -164,7 +166,6 @@ final class SpaceSimulationController: ObservableObject {
             mat.diffuse.contents = whitePixel
 
             if body.id == "sgr_a" {
-                // Горизонт событий чёрной дыры + тонкое фотонное кольцо
                 mat.lightingModel = .constant
                 mat.diffuse.contents = UIColor.black
                 mat.shaderModifiers = [.fragment: """
@@ -176,7 +177,6 @@ final class SpaceSimulationController: ObservableObject {
                 mat.lightingModel = .constant
                 mat.shaderModifiers = [.surface: starShaderModifier(for: body)]
 
-                // Мягкая корона звезды
                 let corona = SCNSphere(radius: 1.28)
                 corona.segmentCount = 64
                 let cMat = SCNMaterial()
@@ -251,52 +251,24 @@ final class SpaceSimulationController: ObservableObject {
                 root.addChildNode(SCNNode(geometry: atmoSphere))
             }
 
-            // Попиксельный шейдерный диск колец (без discard_fragment — 100% без розового бага!)
             if body.hasRings {
                 let isBH = (body.id == "sgr_a")
-                let planeSize: CGFloat = isBH ? 8.0 : 5.2
+                let isUranus = (body.id == "uranus")
+                let planeSize: CGFloat = isBH ? 7.6 : (isUranus ? 3.8 : 5.2)
                 let ringPlane = SCNPlane(width: planeSize, height: planeSize)
                 let ringMat = SCNMaterial()
                 ringMat.lightingModel = .constant
-                ringMat.diffuse.contents = whitePixel
+                ringMat.diffuse.contents = generateDetailedRingImage(isBlackHole: isBH, isUranus: isUranus)
                 ringMat.isDoubleSided = true
                 ringMat.writesToDepthBuffer = false
                 ringMat.blendMode = isBH ? .add : .alpha
 
-                if isBH {
-                    ringMat.shaderModifiers = [.fragment: """
-                        vec2 uv = (_surface.diffuseTexcoord - vec2(0.5, 0.5)) * 2.0;
-                        float r = length(uv);
-                        float mask = smoothstep(0.24, 0.30, r) * smoothstep(1.0, 0.38, r);
-                        float angle = atan(uv.y, uv.x);
-                        float swirl = sin(r * 38.0 - angle * 3.0 + u_time * 1.5) * 0.5 + 0.5;
-                        float swirl2 = sin(r * 76.0 + angle * 5.0 - u_time * 2.2) * 0.5 + 0.5;
-                        float heat = pow(clamp(1.0 - (r - 0.25) / 0.75, 0.0, 1.0), 1.8);
-                        vec3 innerCol = vec3(1.0, 0.92, 0.72);
-                        vec3 outerCol = vec3(0.95, 0.32, 0.04);
-                        vec3 col = mix(outerCol, innerCol, heat) * (0.60 + 0.45 * swirl * swirl2);
-                        float alpha = mask * (0.75 + 0.25 * swirl);
-                        _output.color = vec4(col * alpha * 1.5, alpha);
-                    """]
-                } else {
-                    ringMat.shaderModifiers = [.fragment: """
-                        vec2 uv = (_surface.diffuseTexcoord - vec2(0.5, 0.5)) * 2.0;
-                        float r = length(uv);
-                        float fade = smoothstep(0.46, 0.52, r) * smoothstep(0.98, 0.92, r);
-                        float cassini = 1.0 - smoothstep(0.018, 0.0, abs(r - 0.775));
-                        float encke = 1.0 - smoothstep(0.005, 0.0, abs(r - 0.91));
-                        float bands = sin(r * 190.0) * 0.25 + sin(r * 430.0) * 0.15 + 0.65;
-                        vec3 c1 = vec3(0.86, 0.78, 0.62);
-                        vec3 c2 = vec3(0.62, 0.54, 0.42);
-                        vec3 col = mix(c2, c1, clamp(bands, 0.0, 1.0));
-                        float alpha = clamp(fade * bands * cassini * encke * 0.88, 0.0, 0.92);
-                        _output.color = vec4(col, alpha);
-                    """]
-                }
-
                 ringPlane.materials = [ringMat]
                 let ringNode = SCNNode(geometry: ringPlane)
                 ringNode.eulerAngles = SCNVector3(-Float.pi / 2.0 + (isBH ? 0.22 : 0.0), 0.0, 0.0)
+                if isBH {
+                    ringNode.runAction(.repeatForever(.rotateBy(x: 0, y: 0, z: .pi * 2, duration: 14.0)))
+                }
                 root.addChildNode(ringNode)
             }
 
@@ -459,7 +431,6 @@ final class SpaceSimulationController: ObservableObject {
         """
     }
 
-    // Реалистичный шейдер кипящей плазмы звёзд (без белого пересвета, с грануляцией и пятнами)
     private func starShaderModifier(for body: CelestialBody) -> String {
         let c1 = rgbComponents(body.colorHex)
         let c2 = rgbComponents(body.secondaryHex)
@@ -496,10 +467,7 @@ final class SpaceSimulationController: ObservableObject {
         float g3 = noise3D(pos * 38.0 + vec3(u_time * 0.14, 0.0, 0.0));
         float plasma = g1 * 0.50 + g2 * 0.32 + g3 * 0.18;
 
-        // Тёмные магнитные пятна на фотосфере
         float spots = smoothstep(0.22, 0.34, g1 * 0.7 + g2 * 0.3);
-
-        // Физическое потемнение к краю диска (limb darkening)
         float ndotv = clamp(abs(dot(normalize(_surface.normal), normalize(_surface.view))), 0.0, 1.0);
         float limb = 0.35 + 0.65 * pow(ndotv, 0.55);
 
@@ -581,60 +549,317 @@ final class SpaceSimulationController: ObservableObject {
         }
     }
 
+    // Детализированный 3D-кокпит в стиле Elite Dangerous (МФД-экраны, 3D-радар, живой HOTAS, верхняя панель)
     private func buildFirstPersonCockpit() {
-        let frameMat = SCNMaterial()
-        frameMat.lightingModel = .constant
-        frameMat.diffuse.contents = UIColor(red: 0.11, green: 0.14, blue: 0.20, alpha: 1.0)
+        let darkMetal = SCNMaterial()
+        darkMetal.lightingModel = .physicallyBased
+        darkMetal.diffuse.contents = UIColor(red: 0.09, green: 0.11, blue: 0.15, alpha: 1.0)
+        darkMetal.metalness.contents = 0.72
+        darkMetal.roughness.contents = 0.42
+
+        let lightMetal = SCNMaterial()
+        lightMetal.lightingModel = .physicallyBased
+        lightMetal.diffuse.contents = UIColor(red: 0.18, green: 0.22, blue: 0.28, alpha: 1.0)
+        lightMetal.metalness.contents = 0.80
+        lightMetal.roughness.contents = 0.32
 
         let neonCyan = SCNMaterial()
         neonCyan.lightingModel = .constant
-        neonCyan.diffuse.contents = UIColor(red: 0.0, green: 0.85, blue: 1.0, alpha: 1.0)
+        neonCyan.diffuse.contents = UIColor(red: 0.05, green: 0.86, blue: 1.0, alpha: 1.0)
 
         let neonOrange = SCNMaterial()
         neonOrange.lightingModel = .constant
-        neonOrange.diffuse.contents = UIColor(red: 1.0, green: 0.52, blue: 0.12, alpha: 1.0)
+        neonOrange.diffuse.contents = UIColor(red: 1.0, green: 0.50, blue: 0.10, alpha: 1.0)
 
-        let dash = SCNBox(width: 2.2, height: 0.36, length: 0.7, chamferRadius: 0.04)
-        dash.materials = [frameMat]
-        let dashNode = SCNNode(geometry: dash)
-        dashNode.position = SCNVector3(0, -0.58, -0.85)
-        dashNode.eulerAngles.x = 0.32
+        let neonGreen = SCNMaterial()
+        neonGreen.lightingModel = .constant
+        neonGreen.diffuse.contents = UIColor(red: 0.20, green: 0.95, blue: 0.45, alpha: 1.0)
+
+        // Внутренняя мягкая подсветка кабины, чтобы металлические грани переливались
+        let cabinLight = SCNLight()
+        cabinLight.type = .omni
+        cabinLight.intensity = 180
+        cabinLight.color = UIColor(red: 0.35, green: 0.72, blue: 1.0, alpha: 1.0)
+        cabinLight.attenuationStartDistance = 0.2
+        cabinLight.attenuationEndDistance = 2.4
+        let lightNode = SCNNode()
+        lightNode.light = cabinLight
+        lightNode.position = SCNVector3(0, 0.15, -0.35)
+        cockpitMeshNode.addChildNode(lightNode)
+
+        // 1. Многоуровневая приборная панель (торпеда + центральный козырёк)
+        let mainDash = SCNBox(width: 2.3, height: 0.28, length: 0.65, chamferRadius: 0.03)
+        mainDash.materials = [darkMetal]
+        let dashNode = SCNNode(geometry: mainDash)
+        dashNode.position = SCNVector3(0, -0.56, -0.82)
+        dashNode.eulerAngles.x = 0.26
         cockpitMeshNode.addChildNode(dashNode)
 
-        let trim = SCNBox(width: 1.9, height: 0.012, length: 0.02, chamferRadius: 0.004)
-        trim.materials = [neonCyan]
-        let trimNode = SCNNode(geometry: trim)
-        trimNode.position = SCNVector3(0, -0.40, -0.60)
+        let centerHood = SCNBox(width: 0.68, height: 0.06, length: 0.38, chamferRadius: 0.02)
+        centerHood.materials = [lightMetal]
+        let hoodNode = SCNNode(geometry: centerHood)
+        hoodNode.position = SCNVector3(0, -0.40, -0.84)
+        hoodNode.eulerAngles.x = 0.15
+        cockpitMeshNode.addChildNode(hoodNode)
+
+        // Оранжевая и голубая неоновые линии вдоль кромки торпеды
+        let trimCyan = SCNBox(width: 1.95, height: 0.008, length: 0.015, chamferRadius: 0.003)
+        trimCyan.materials = [neonCyan]
+        let trimNode = SCNNode(geometry: trimCyan)
+        trimNode.position = SCNVector3(0, -0.42, -0.58)
         cockpitMeshNode.addChildNode(trimNode)
 
+        // 2. Левый и правый МФД-экраны с процедурной графикой (щиты/системы и орбитальный сканер)
+        let leftScreen = SCNPlane(width: 0.38, height: 0.19)
+        let leftMat = SCNMaterial()
+        leftMat.lightingModel = .constant
+        leftMat.diffuse.contents = generateMFDTexture(isLeft: true)
+        leftScreen.materials = [leftMat]
+        let leftMfd = SCNNode(geometry: leftScreen)
+        leftMfd.position = SCNVector3(-0.46, -0.42, -0.68)
+        leftMfd.eulerAngles = SCNVector3(-0.34, 0.24, 0)
+        cockpitMeshNode.addChildNode(leftMfd)
+
+        let rightScreen = SCNPlane(width: 0.38, height: 0.19)
+        let rightMat = SCNMaterial()
+        rightMat.lightingModel = .constant
+        rightMat.diffuse.contents = generateMFDTexture(isLeft: false)
+        rightScreen.materials = [rightMat]
+        let rightMfd = SCNNode(geometry: rightScreen)
+        rightMfd.position = SCNVector3(0.46, -0.42, -0.68)
+        rightMfd.eulerAngles = SCNVector3(-0.34, -0.24, 0)
+        cockpitMeshNode.addChildNode(rightMfd)
+
+        // 3. 3D-голографический радар по центру консоли (вращающиеся кольца)
+        let radarGroup = SCNNode()
+        radarGroup.position = SCNVector3(0, -0.35, -0.68)
+        radarGroup.eulerAngles.x = 0.22
+
+        let holoMat = SCNMaterial()
+        holoMat.lightingModel = .constant
+        holoMat.diffuse.contents = UIColor(red: 1.0, green: 0.56, blue: 0.12, alpha: 0.85)
+        holoMat.blendMode = .add
+        holoMat.writesToDepthBuffer = false
+
+        let holoCyanMat = SCNMaterial()
+        holoCyanMat.lightingModel = .constant
+        holoCyanMat.diffuse.contents = UIColor(red: 0.1, green: 0.88, blue: 1.0, alpha: 0.8)
+        holoCyanMat.blendMode = .add
+        holoCyanMat.writesToDepthBuffer = false
+
+        for (idx, r) in [0.055, 0.095, 0.135].enumerated() {
+            let ring = SCNTorus(ringRadius: CGFloat(r), pipeRadius: 0.0022)
+            ring.materials = [idx == 1 ? holoCyanMat : holoMat]
+            radarGroup.addChildNode(SCNNode(geometry: ring))
+        }
+        // Центральный маркер корабля на радаре
+        let shipIcon = SCNPyramid(width: 0.022, height: 0.032, length: 0.012)
+        shipIcon.materials = [holoCyanMat]
+        let iconNode = SCNNode(geometry: shipIcon)
+        iconNode.eulerAngles.x = -.pi / 2
+        iconNode.position = SCNVector3(0, 0.01, 0)
+        radarGroup.addChildNode(iconNode)
+
+        // Сканирующая перекладина радара
+        let sweep = SCNBox(width: 0.26, height: 0.002, length: 0.003, chamferRadius: 0)
+        sweep.materials = [holoMat]
+        let sweepNode = SCNNode(geometry: sweep)
+        sweepNode.runAction(.repeatForever(.rotateBy(x: 0, y: .pi * 2, z: 0, duration: 5.5)))
+        radarGroup.addChildNode(sweepNode)
+        cockpitMeshNode.addChildNode(radarGroup)
+
+        // 4. Живые органы управления HOTAS (РУД слева, РУС/джойстик справа)
+        cockpitThrottlePivot.position = SCNVector3(-0.62, -0.48, -0.50)
+        let throttleArm = SCNBox(width: 0.035, height: 0.12, length: 0.03, chamferRadius: 0.006)
+        throttleArm.materials = [lightMetal]
+        let tArmNode = SCNNode(geometry: throttleArm)
+        tArmNode.position = SCNVector3(0, 0.06, 0)
+        cockpitThrottlePivot.addChildNode(tArmNode)
+
+        let throttleGrip = SCNBox(width: 0.11, height: 0.04, length: 0.055, chamferRadius: 0.012)
+        throttleGrip.materials = [darkMetal]
+        let tGripNode = SCNNode(geometry: throttleGrip)
+        tGripNode.position = SCNVector3(0, 0.12, 0)
+        cockpitThrottlePivot.addChildNode(tGripNode)
+
+        let tLed = SCNBox(width: 0.07, height: 0.008, length: 0.01, chamferRadius: 0.002)
+        tLed.materials = [neonCyan]
+        let tLedNode = SCNNode(geometry: tLed)
+        tLedNode.position = SCNVector3(0, 0.142, -0.015)
+        cockpitThrottlePivot.addChildNode(tLedNode)
+        cockpitMeshNode.addChildNode(cockpitThrottlePivot)
+
+        cockpitStickPivot.position = SCNVector3(0.62, -0.50, -0.50)
+        let stickShaft = SCNCylinder(radius: 0.014, height: 0.15)
+        stickShaft.materials = [lightMetal]
+        let sShaftNode = SCNNode(geometry: stickShaft)
+        sShaftNode.position = SCNVector3(0, 0.075, 0)
+        cockpitStickPivot.addChildNode(sShaftNode)
+
+        let stickHead = SCNBox(width: 0.042, height: 0.055, length: 0.048, chamferRadius: 0.012)
+        stickHead.materials = [darkMetal]
+        let sHeadNode = SCNNode(geometry: stickHead)
+        sHeadNode.position = SCNVector3(0, 0.15, 0)
+        cockpitStickPivot.addChildNode(sHeadNode)
+
+        let triggerLed = SCNSphere(radius: 0.007)
+        triggerLed.materials = [neonOrange]
+        let trigNode = SCNNode(geometry: triggerLed)
+        trigNode.position = SCNVector3(0, 0.175, -0.015)
+        cockpitStickPivot.addChildNode(trigNode)
+        cockpitMeshNode.addChildNode(cockpitStickPivot)
+
+        // 5. Гранёный переплёт фонаря кабины и верхняя панель статуса
         for side in [-1.0, 1.0] {
-            let strut = SCNBox(width: 0.04, height: 1.15, length: 0.04, chamferRadius: 0.01)
-            strut.materials = [frameMat]
-            let sNode = SCNNode(geometry: strut)
-            sNode.position = SCNVector3(Float(side * 0.74), 0.05, -0.75)
-            sNode.eulerAngles = SCNVector3(0.22, 0, Float(side * 0.26))
+            let mainStrut = SCNBox(width: 0.048, height: 1.25, length: 0.055, chamferRadius: 0.01)
+            mainStrut.materials = [darkMetal]
+            let sNode = SCNNode(geometry: mainStrut)
+            sNode.position = SCNVector3(Float(side * 0.78), 0.06, -0.74)
+            sNode.eulerAngles = SCNVector3(0.24, 0, Float(side * 0.25))
             cockpitMeshNode.addChildNode(sNode)
 
-            let led = SCNBox(width: 0.012, height: 0.25, length: 0.012, chamferRadius: 0.004)
-            led.materials = [neonOrange]
-            let lNode = SCNNode(geometry: led)
-            lNode.position = SCNVector3(Float(side * 0.71), 0.05, -0.73)
-            lNode.eulerAngles = SCNVector3(0.22, 0, Float(side * 0.26))
+            let innerBevel = SCNBox(width: 0.014, height: 1.15, length: 0.02, chamferRadius: 0.004)
+            innerBevel.materials = [lightMetal]
+            let bNode = SCNNode(geometry: innerBevel)
+            bNode.position = SCNVector3(Float(side * 0.752), 0.06, -0.72)
+            bNode.eulerAngles = SCNVector3(0.24, 0, Float(side * 0.25))
+            cockpitMeshNode.addChildNode(bNode)
+
+            let ledStrip = SCNBox(width: 0.009, height: 0.22, length: 0.009, chamferRadius: 0.003)
+            ledStrip.materials = [neonOrange]
+            let lNode = SCNNode(geometry: ledStrip)
+            lNode.position = SCNVector3(Float(side * 0.74), 0.04, -0.71)
+            lNode.eulerAngles = SCNVector3(0.24, 0, Float(side * 0.25))
             cockpitMeshNode.addChildNode(lNode)
         }
 
-        let topBar = SCNBox(width: 1.38, height: 0.035, length: 0.035, chamferRadius: 0.01)
-        topBar.materials = [frameMat]
+        // Верхняя консоль с индикаторами систем
+        let topBar = SCNBox(width: 1.44, height: 0.06, length: 0.12, chamferRadius: 0.012)
+        topBar.materials = [darkMetal]
         let topNode = SCNNode(geometry: topBar)
-        topNode.position = SCNVector3(0, 0.56, -0.64)
+        topNode.position = SCNVector3(0, 0.57, -0.64)
+        topNode.eulerAngles.x = 0.25
         cockpitMeshNode.addChildNode(topNode)
 
-        let crosshair = SCNTorus(ringRadius: 0.042, pipeRadius: 0.0022)
-        crosshair.materials = [neonCyan]
-        let chNode = SCNNode(geometry: crosshair)
-        chNode.eulerAngles.x = .pi / 2
-        chNode.position = SCNVector3(0, 0.02, -0.95)
-        cockpitMeshNode.addChildNode(chNode)
+        for i in -3...3 {
+            let led = SCNBox(width: 0.028, height: 0.008, length: 0.008, chamferRadius: 0.002)
+            led.materials = [i == 0 ? neonCyan : (abs(i) == 3 ? neonOrange : neonGreen)]
+            let ledNode = SCNNode(geometry: led)
+            ledNode.position = SCNVector3(Float(i) * 0.065, 0.545, -0.59)
+            cockpitMeshNode.addChildNode(ledNode)
+        }
+
+        // 6. Голографический прицел (коллиматор с боковыми дугами тангажа)
+        let hudGroup = SCNNode()
+        hudGroup.position = SCNVector3(0, 0.02, -0.95)
+
+        let reticle = SCNTorus(ringRadius: 0.036, pipeRadius: 0.0018)
+        reticle.materials = [holoCyanMat]
+        let rNode = SCNNode(geometry: reticle)
+        rNode.eulerAngles.x = .pi / 2
+        hudGroup.addChildNode(rNode)
+
+        let centerDot = SCNSphere(radius: 0.003)
+        centerDot.materials = [holoMat]
+        hudGroup.addChildNode(SCNNode(geometry: centerDot))
+
+        for side in [-1.0, 1.0] {
+            let bracket = SCNBox(width: 0.003, height: 0.12, length: 0.002, chamferRadius: 0)
+            bracket.materials = [holoCyanMat]
+            let brNode = SCNNode(geometry: bracket)
+            brNode.position = SCNVector3(Float(side * 0.16), 0, 0)
+            hudGroup.addChildNode(brNode)
+
+            for tick in [-0.045, 0.0, 0.045] {
+                let tickBar = SCNBox(width: 0.022, height: 0.002, length: 0.002, chamferRadius: 0)
+                tickBar.materials = [holoMat]
+                let tNode = SCNNode(geometry: tickBar)
+                tNode.position = SCNVector3(Float(side * 0.145), Float(tick), 0)
+                hudGroup.addChildNode(tNode)
+            }
+        }
+        cockpitMeshNode.addChildNode(hudGroup)
+    }
+
+    private func generateMFDTexture(isLeft: Bool) -> UIImage {
+        let w = 512, h = 256
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: w, height: h))
+        return renderer.image { context in
+            let ctx = context.cgContext
+            ctx.setFillColor(UIColor(red: 0.02, green: 0.06, blue: 0.10, alpha: 0.96).cgColor)
+            ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+
+            // Рамка и сетка дисплея
+            let cyan = UIColor(red: 0.05, green: 0.86, blue: 1.0, alpha: 1.0)
+            let orange = UIColor(red: 1.0, green: 0.52, blue: 0.12, alpha: 1.0)
+            ctx.setStrokeColor(cyan.withAlphaComponent(0.65).cgColor)
+            ctx.setLineWidth(4)
+            ctx.stroke(CGRect(x: 6, y: 6, width: w - 12, height: h - 12))
+
+            ctx.setStrokeColor(cyan.withAlphaComponent(0.14).cgColor)
+            ctx.setLineWidth(1)
+            for x in stride(from: 32, to: w, by: 32) {
+                ctx.move(to: CGPoint(x: x, y: 8))
+                ctx.addLine(to: CGPoint(x: x, y: h - 8))
+            }
+            for y in stride(from: 32, to: h, by: 32) {
+                ctx.move(to: CGPoint(x: 8, y: y))
+                ctx.addLine(to: CGPoint(x: w - 8, y: y))
+            }
+            ctx.strokePath()
+
+            if isLeft {
+                // Схема щитов и корпуса корабля
+                let cx: CGFloat = 135, cy: CGFloat = 128
+                for r in [76, 62, 48] {
+                    ctx.setStrokeColor(cyan.withAlphaComponent(r == 76 ? 0.9 : 0.45).cgColor)
+                    ctx.setLineWidth(r == 76 ? 4 : 2)
+                    ctx.strokeEllipse(in: CGRect(x: cx - CGFloat(r), y: cy - CGFloat(r), width: CGFloat(r * 2), height: CGFloat(r * 2)))
+                }
+                // Силуэт звездолёта внутри щита
+                ctx.setStrokeColor(orange.cgColor)
+                ctx.setLineWidth(3)
+                ctx.move(to: CGPoint(x: cx, y: cy - 34))
+                ctx.addLine(to: CGPoint(x: cx + 32, y: cy + 24))
+                ctx.addLine(to: CGPoint(x: cx, y: cy + 12))
+                ctx.addLine(to: CGPoint(x: cx - 32, y: cy + 24))
+                ctx.closePath()
+                ctx.strokePath()
+
+                // Шкалы энергии SYS / ENG / WEP
+                let labels = [("SYS", 0.85, cyan), ("ENG", 0.95, orange), ("WEP", 0.65, cyan)]
+                for (i, item) in labels.enumerated() {
+                    let y = CGFloat(54 + i * 58)
+                    ctx.setFillColor(item.2.withAlphaComponent(0.22).cgColor)
+                    ctx.fill(CGRect(x: 260, y: y, width: 215, height: 24))
+                    ctx.setFillColor(item.2.cgColor)
+                    ctx.fill(CGRect(x: 260, y: y, width: CGFloat(215.0 * item.1), height: 24))
+                }
+            } else {
+                // Правый экран: орбитальная диаграмма и спектр сканера
+                let cx: CGFloat = 370, cy: CGFloat = 128
+                ctx.setStrokeColor(orange.withAlphaComponent(0.8).cgColor)
+                ctx.setLineWidth(2.5)
+                ctx.strokeEllipse(in: CGRect(x: cx - 95, y: cy - 65, width: 190, height: 130))
+                ctx.setStrokeColor(cyan.withAlphaComponent(0.75).cgColor)
+                ctx.strokeEllipse(in: CGRect(x: cx - 55, y: cy - 38, width: 110, height: 76))
+                ctx.setFillColor(orange.cgColor)
+                ctx.fillEllipse(in: CGRect(x: cx - 12, y: cy - 12, width: 24, height: 24))
+                ctx.setFillColor(cyan.cgColor)
+                ctx.fillEllipse(in: CGRect(x: cx + 82, y: cy - 16, width: 12, height: 12))
+
+                // Волна FSS-сканера слева
+                ctx.setStrokeColor(cyan.cgColor)
+                ctx.setLineWidth(3)
+                ctx.move(to: CGPoint(x: 24, y: 128))
+                for x in stride(from: 24, through: 235, by: 6) {
+                    let t = Double(x) * 0.08
+                    let y = 128.0 + sin(t) * 48.0 * cos(t * 0.35)
+                    ctx.addLine(to: CGPoint(x: CGFloat(x), y: CGFloat(y)))
+                }
+                ctx.strokePath()
+            }
+        }
     }
 
     func updateCameraMode() {
@@ -697,6 +922,70 @@ final class SpaceSimulationController: ObservableObject {
         return faces
     }
 
+    private func generateDetailedRingImage(isBlackHole: Bool, isUranus: Bool) -> UIImage {
+        let size = 1024
+        let format = UIGraphicsImageRendererFormat()
+        format.opaque = false
+        format.scale = 1.0
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: size, height: size), format: format)
+
+        return renderer.image { context in
+            let ctx = context.cgContext
+            ctx.clear(CGRect(x: 0, y: 0, width: size, height: size))
+            let center = CGPoint(x: size / 2, y: size / 2)
+
+            if isBlackHole {
+                for r in 135..<495 {
+                    let t = CGFloat(r - 135) / 360.0
+                    let fade = sin(min(1.0, t * 7.0) * .pi * 0.5) * pow(1.0 - t, 1.55)
+                    let red: CGFloat = 1.0
+                    let green: CGFloat = max(0.18, 0.92 - t * 0.78)
+                    let blue: CGFloat = max(0.02, 0.68 - t * 1.15)
+                    let wave = 0.72 + 0.28 * sin(Double(r) * 0.14)
+                    ctx.setStrokeColor(UIColor(red: red, green: green, blue: blue, alpha: fade * CGFloat(wave) * 0.85).cgColor)
+                    ctx.setLineWidth(1.8)
+                    ctx.addArc(center: center, radius: CGFloat(r), startAngle: 0, endAngle: .pi * 2, clockwise: false)
+                    ctx.strokePath()
+                }
+                for s in 0..<24 {
+                    let startAngle = CGFloat(s) * (.pi * 2.0 / 24.0)
+                    let radius = CGFloat(155 + (s * 47) % 270)
+                    let arcLen = CGFloat(0.6 + Double(s % 5) * 0.35)
+                    ctx.setStrokeColor(UIColor(red: 1.0, green: 0.78, blue: 0.42, alpha: 0.35).cgColor)
+                    ctx.setLineWidth(CGFloat(3 + (s % 6)))
+                    ctx.addArc(center: center, radius: radius, startAngle: startAngle, endAngle: startAngle + arcLen, clockwise: false)
+                    ctx.strokePath()
+                }
+            } else if isUranus {
+                let ringRadii: [(r: CGFloat, w: CGFloat, a: CGFloat)] = [
+                    (310, 2.5, 0.22), (335, 3.0, 0.28), (360, 2.0, 0.18),
+                    (395, 4.0, 0.35), (430, 5.5, 0.48), (465, 2.5, 0.25)
+                ]
+                for ring in ringRadii {
+                    ctx.setStrokeColor(UIColor(red: 0.72, green: 0.88, blue: 0.96, alpha: ring.a).cgColor)
+                    ctx.setLineWidth(ring.w)
+                    ctx.addArc(center: center, radius: ring.r, startAngle: 0, endAngle: .pi * 2, clockwise: false)
+                    ctx.strokePath()
+                }
+            } else {
+                for r in 235..<492 {
+                    if (r >= 382 && r <= 398) || (r >= 456 && r <= 460) { continue }
+                    let t = CGFloat(r - 235) / 257.0
+                    let edgeFade = min(1.0, t * 14.0) * min(1.0, (1.0 - t) * 14.0)
+                    let bands = 0.55 + 0.28 * sin(Double(r) * 0.38) + 0.17 * cos(Double(r) * 0.95)
+                    let cr = 0.74 + 0.14 * CGFloat(bands)
+                    let cg = 0.66 + 0.13 * CGFloat(bands)
+                    let cb = 0.50 + 0.12 * CGFloat(bands)
+                    let alpha = edgeFade * CGFloat(bands) * 0.88
+                    ctx.setStrokeColor(UIColor(red: cr, green: cg, blue: cb, alpha: alpha).cgColor)
+                    ctx.setLineWidth(1.5)
+                    ctx.addArc(center: center, radius: CGFloat(r), startAngle: 0, endAngle: .pi * 2, clockwise: false)
+                    ctx.strokePath()
+                }
+            }
+        }
+    }
+
     func handleCameraOrbitDrag(dx: Double, dy: Double) {
         if isThirdPerson {
             orbitYaw -= Float(dx * 0.006)
@@ -723,7 +1012,6 @@ final class SpaceSimulationController: ObservableObject {
         updateCameraMode()
     }
 
-    /// Перелёт всегда выводит корабль на ОСВЕЩЁННУЮ сторону планеты (возле терминатора)
     func warpToBody(_ body: CelestialBody) {
         targetBody = body
         throttle = 0
@@ -776,6 +1064,14 @@ final class SpaceSimulationController: ObservableObject {
         let desiredPitchVis = Float(angularVelPitch * 0.18)
         shipVisualNode.eulerAngles.z += (desiredBank - shipVisualNode.eulerAngles.z) * Float(min(1.0, realDt * 8.0))
         shipVisualNode.eulerAngles.x += (desiredPitchVis - shipVisualNode.eulerAngles.x) * Float(min(1.0, realDt * 8.0))
+
+        // Анимация живого джойстика и РУД внутри 3D-кокпита
+        let targetStickX = Float(stickInput.y * 0.32)
+        let targetStickZ = Float(-stickInput.x * 0.32)
+        cockpitStickPivot.eulerAngles.x += (targetStickX - cockpitStickPivot.eulerAngles.x) * Float(min(1.0, realDt * 12.0))
+        cockpitStickPivot.eulerAngles.z += (targetStickZ - cockpitStickPivot.eulerAngles.z) * Float(min(1.0, realDt * 12.0))
+        let targetThrottleAngle = Float(0.35 - throttle * 0.78)
+        cockpitThrottlePivot.eulerAngles.x += (targetThrottleAngle - cockpitThrottlePivot.eulerAngles.x) * Float(min(1.0, realDt * 10.0))
 
         cameraLagYaw += (Float(-angularVelYaw * 0.14) - cameraLagYaw) * Float(min(1.0, realDt * 5.0))
         cameraLagPitch += (Float(-angularVelPitch * 0.10) - cameraLagPitch) * Float(min(1.0, realDt * 5.0))
