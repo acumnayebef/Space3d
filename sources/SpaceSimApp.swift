@@ -27,7 +27,6 @@ final class SpaceSimulationController: ObservableObject {
     var exhaustNodes: [SCNNode] = []
     var dustParticles: [(node: SCNNode, offset: SIMD3<Float>)] = []
 
-    // 64-битные координаты и физика 1:1
     var shipPositionMeters = SIMD3<Double>(-UniverseCatalog.au + 10_200_000, 2_800_000, 11_400_000)
     var shipVelocityMetersPerSec = SIMD3<Double>(0, 0, 0)
     var shipOrientation = simd_quatd(angle: 0.68, axis: simd_normalize(SIMD3<Double>(-0.18, 1.0, 0.0)))
@@ -104,7 +103,7 @@ final class SpaceSimulationController: ObservableObject {
 
         let ambient = SCNLight()
         ambient.type = .ambient
-        ambient.intensity = 16
+        ambient.intensity = 22
         ambient.color = UIColor(red: 0.12, green: 0.18, blue: 0.30, alpha: 1.0)
         let ambientNode = SCNNode()
         ambientNode.light = ambient
@@ -162,7 +161,6 @@ final class SpaceSimulationController: ObservableObject {
             sphere.segmentCount = 144
 
             let mat = SCNMaterial()
-            // Обязательно привязываем 2x2 текстуру, чтобы SceneKit передавал _surface.diffuseTexcoord в шейдер!
             mat.diffuse.contents = whitePixel
 
             if body.id == "sgr_a" {
@@ -171,16 +169,15 @@ final class SpaceSimulationController: ObservableObject {
                 mat.diffuse.contents = UIColor.black
                 mat.shaderModifiers = [.fragment: """
                     float ndotv = clamp(abs(dot(normalize(_surface.normal), normalize(_surface.view))), 0.0, 1.0);
-                    float photonRing = pow(1.0 - ndotv, 10.0) * 2.8;
+                    float photonRing = pow(1.0 - ndotv, 9.0) * 3.0;
                     _output.color = vec4(vec3(1.0, 0.72, 0.35) * photonRing, 1.0);
                 """]
             } else if body.isStar {
                 mat.lightingModel = .constant
-                mat.emission.contents = uiColor(from: body.colorHex)
                 mat.shaderModifiers = [.surface: starShaderModifier(for: body)]
 
                 // Мягкая корона звезды
-                let corona = SCNSphere(radius: 1.24)
+                let corona = SCNSphere(radius: 1.28)
                 corona.segmentCount = 64
                 let cMat = SCNMaterial()
                 cMat.lightingModel = .constant
@@ -190,7 +187,7 @@ final class SpaceSimulationController: ObservableObject {
                 let c = rgbComponents(body.colorHex)
                 cMat.shaderModifiers = [.fragment: """
                     float ndotv = clamp(abs(dot(normalize(_surface.normal), normalize(_surface.view))), 0.0, 1.0);
-                    float glow = pow(ndotv, 3.6) * 0.95;
+                    float glow = pow(ndotv, 3.8) * 0.85;
                     _output.color = vec4(vec3(\(c.r), \(c.g), \(c.b)) * glow, glow);
                 """]
                 corona.materials = [cMat]
@@ -209,7 +206,6 @@ final class SpaceSimulationController: ObservableObject {
             root.addChildNode(meshNode)
             planetMeshNodes[body.id] = meshNode
 
-            // Фотореалистичная атмосфера (мягкое рэлеевское рассеяние + оранжевый закат на терминаторе, ночь тёмная)
             if body.hasAtmosphere && !body.isStar {
                 let atmoSphere = SCNSphere(radius: 1.055)
                 atmoSphere.segmentCount = 96
@@ -255,7 +251,7 @@ final class SpaceSimulationController: ObservableObject {
                 root.addChildNode(SCNNode(geometry: atmoSphere))
             }
 
-            // Попиксельный шейдерный диск колец (Сатурн / Уран / аккреционный диск Стрельца A*)
+            // Попиксельный шейдерный диск колец (без discard_fragment — 100% без розового бага!)
             if body.hasRings {
                 let isBH = (body.id == "sgr_a")
                 let planeSize: CGFloat = isBH ? 8.0 : 5.2
@@ -271,32 +267,29 @@ final class SpaceSimulationController: ObservableObject {
                     ringMat.shaderModifiers = [.fragment: """
                         vec2 uv = (_surface.diffuseTexcoord - vec2(0.5, 0.5)) * 2.0;
                         float r = length(uv);
-                        if (r < 0.26 || r > 1.0) { discard_fragment(); }
+                        float mask = smoothstep(0.24, 0.30, r) * smoothstep(1.0, 0.38, r);
                         float angle = atan(uv.y, uv.x);
-                        float swirl = sin(r * 42.0 - angle * 3.0 + u_time * 1.6) * 0.5 + 0.5;
-                        float swirl2 = sin(r * 85.0 + angle * 5.0 - u_time * 2.4) * 0.5 + 0.5;
-                        float density = smoothstep(0.26, 0.34, r) * smoothstep(1.0, 0.32, r);
-                        float heat = pow(1.0 - (r - 0.26) / 0.74, 1.8);
+                        float swirl = sin(r * 38.0 - angle * 3.0 + u_time * 1.5) * 0.5 + 0.5;
+                        float swirl2 = sin(r * 76.0 + angle * 5.0 - u_time * 2.2) * 0.5 + 0.5;
+                        float heat = pow(clamp(1.0 - (r - 0.25) / 0.75, 0.0, 1.0), 1.8);
                         vec3 innerCol = vec3(1.0, 0.92, 0.72);
-                        vec3 outerCol = vec3(0.95, 0.35, 0.05);
-                        vec3 col = mix(outerCol, innerCol, heat) * (0.65 + 0.35 * swirl * swirl2);
-                        float alpha = clamp(density * (0.7 + 0.4 * swirl), 0.0, 1.0);
-                        _output.color = vec4(col * 1.4, alpha);
+                        vec3 outerCol = vec3(0.95, 0.32, 0.04);
+                        vec3 col = mix(outerCol, innerCol, heat) * (0.60 + 0.45 * swirl * swirl2);
+                        float alpha = mask * (0.75 + 0.25 * swirl);
+                        _output.color = vec4(col * alpha * 1.5, alpha);
                     """]
                 } else {
                     ringMat.shaderModifiers = [.fragment: """
                         vec2 uv = (_surface.diffuseTexcoord - vec2(0.5, 0.5)) * 2.0;
                         float r = length(uv);
-                        if (r < 0.48 || r > 0.98) { discard_fragment(); }
-                        // Щель Кассини и микрокольца
+                        float fade = smoothstep(0.46, 0.52, r) * smoothstep(0.98, 0.92, r);
                         float cassini = 1.0 - smoothstep(0.018, 0.0, abs(r - 0.775));
                         float encke = 1.0 - smoothstep(0.005, 0.0, abs(r - 0.91));
                         float bands = sin(r * 190.0) * 0.25 + sin(r * 430.0) * 0.15 + 0.65;
-                        float fade = smoothstep(0.48, 0.53, r) * smoothstep(0.98, 0.93, r);
                         vec3 c1 = vec3(0.86, 0.78, 0.62);
                         vec3 c2 = vec3(0.62, 0.54, 0.42);
                         vec3 col = mix(c2, c1, clamp(bands, 0.0, 1.0));
-                        float alpha = clamp(fade * bands * cassini * encke * 0.85, 0.0, 0.92);
+                        float alpha = clamp(fade * bands * cassini * encke * 0.88, 0.0, 0.92);
                         _output.color = vec4(col, alpha);
                     """]
                 }
@@ -312,7 +305,6 @@ final class SpaceSimulationController: ObservableObject {
         }
     }
 
-    // 100% валидный GLSL-шейдер SceneKit с истинными 3D-координатами сферы, рельефом нормалей, облаками и ночными огнями
     private func planetShaderModifier(for body: CelestialBody) -> String {
         let mode: Int
         switch body.id {
@@ -385,7 +377,6 @@ final class SpaceSimulationController: ObservableObject {
 
         int planetMode = \(mode);
         if (planetMode == 1) {
-            // Земля: океаны с шельфом, континенты с биомами, хребты гор, полярные шапки
             float lat = abs(pos.y);
             float warp = fbm(pos * 2.2 + vec3(4.1, 1.7, 8.3)) * 0.25;
             float elev = n + warp - 0.12;
@@ -412,7 +403,6 @@ final class SpaceSimulationController: ObservableObject {
                 rough = 0.92;
                 bumpStrength = 10.0;
 
-                // Ночные огни мегаполисов ТОЛЬКО на тёмной стороне Земли
                 if (h < 0.28 && lat < 0.68 && nightMask > 0.01) {
                     float cityCluster = fbm(pos * 24.0);
                     float lights = hash31(floor(pos * 260.0));
@@ -422,7 +412,6 @@ final class SpaceSimulationController: ObservableObject {
                 }
             }
 
-            // Вихревые облака с тенью на поверхности
             vec3 cWarp = vec3(sin(pos.y * 5.0) * 0.45 + u_time * 0.004, cos(pos.x * 5.0) * 0.25, 0.0);
             float cn = fbm(pos * 4.6 + cWarp + vec3(n * 0.9, -n * 0.5, n * 0.7));
             float cnShadow = fbm((pos + normalize(sunDirLocal) * 0.012) * 4.6 + cWarp + vec3(n * 0.9, -n * 0.5, n * 0.7));
@@ -433,14 +422,12 @@ final class SpaceSimulationController: ObservableObject {
             emissive *= (1.0 - clouds * 0.85);
             rough = mix(rough, 0.94, clouds);
         } else if (planetMode == 2) {
-            // Марс: ржавые плато, каньоны и полярные шапки
             float lat = abs(pos.y);
             albedo = mix(col2, col1, smoothstep(0.24, 0.74, n));
             albedo = mix(albedo, vec3(0.84, 0.48, 0.28), ridge * 0.25);
             if (lat + detail * 0.12 > 0.88) albedo = vec3(0.95, 0.94, 0.92);
             bumpStrength = 14.0;
         } else if (planetMode == 3) {
-            // Газовые гиганты: турбулентные широтные течения
             float turb = (n - 0.5) * 0.20 + (detail - 0.5) * 0.07;
             float yBand = (pos.y + turb) * 19.0;
             float stripe = sin(yBand) * 0.5 + 0.5;
@@ -448,14 +435,12 @@ final class SpaceSimulationController: ObservableObject {
             albedo *= (0.88 + detail * 0.24);
             rough = 0.62;
         } else {
-            // Луна / Меркурий: кратеры и каменистый рельеф
             float crater = smoothstep(0.32, 0.68, detail);
             albedo = mix(col2, col1, smoothstep(0.22, 0.78, n));
             albedo *= (0.68 + ridge * 0.35 + crater * 0.22);
             bumpStrength = 18.0;
         }
 
-        // Лёгкая атмосферная дымка по краю диска на дневной стороне
         if (planetMode == 1 || planetMode == 2) {
             float ndotv = clamp(abs(dot(normalize(_surface.normal), normalize(_surface.view))), 0.0, 1.0);
             float fresnel = pow(1.0 - ndotv, 3.2) * smoothstep(-0.15, 0.35, sunDot);
@@ -474,6 +459,7 @@ final class SpaceSimulationController: ObservableObject {
         """
     }
 
+    // Реалистичный шейдер кипящей плазмы звёзд (без белого пересвета, с грануляцией и пятнами)
     private func starShaderModifier(for body: CelestialBody) -> String {
         let c1 = rgbComponents(body.colorHex)
         let c2 = rgbComponents(body.secondaryHex)
@@ -504,14 +490,26 @@ final class SpaceSimulationController: ObservableObject {
         float phi = _surface.diffuseTexcoord.x * 6.2831853;
         float theta = _surface.diffuseTexcoord.y * 3.14159265;
         vec3 pos = vec3(sin(theta) * cos(phi), cos(theta), sin(theta) * sin(phi));
-        float g1 = noise3D(pos * 10.0 + vec3(u_time * 0.08, 0.0, 0.0));
-        float g2 = noise3D(pos * 24.0 - vec3(0.0, u_time * 0.12, 0.0));
-        float plasma = g1 * 0.65 + g2 * 0.35;
+
+        float g1 = noise3D(pos * 8.0 + vec3(u_time * 0.06, 0.0, 0.0));
+        float g2 = noise3D(pos * 18.0 - vec3(0.0, u_time * 0.10, u_time * 0.05));
+        float g3 = noise3D(pos * 38.0 + vec3(u_time * 0.14, 0.0, 0.0));
+        float plasma = g1 * 0.50 + g2 * 0.32 + g3 * 0.18;
+
+        // Тёмные магнитные пятна на фотосфере
+        float spots = smoothstep(0.22, 0.34, g1 * 0.7 + g2 * 0.3);
+
+        // Физическое потемнение к краю диска (limb darkening)
         float ndotv = clamp(abs(dot(normalize(_surface.normal), normalize(_surface.view))), 0.0, 1.0);
-        float limb = 0.48 + 0.52 * pow(ndotv, 0.6);
-        vec3 c1 = vec3(\(c1.r), \(c1.g), \(c1.b));
-        vec3 c2 = vec3(\(c2.r), \(c2.g), \(c2.b));
-        _surface.emission = vec4(mix(c2, c1, plasma) * limb * 1.25, 1.0);
+        float limb = 0.35 + 0.65 * pow(ndotv, 0.55);
+
+        vec3 hotCol = vec3(\(c1.r), \(c1.g), \(c1.b));
+        vec3 coolCol = vec3(\(c2.r), \(c2.g), \(c2.b));
+        vec3 starCol = mix(coolCol * 0.65, hotCol * 1.15, smoothstep(0.25, 0.85, plasma));
+        starCol *= (0.35 + 0.65 * spots) * limb;
+
+        _surface.diffuse = vec4(0.0, 0.0, 0.0, 1.0);
+        _surface.emission = vec4(starCol, 1.0);
         """
     }
 
@@ -725,13 +723,24 @@ final class SpaceSimulationController: ObservableObject {
         updateCameraMode()
     }
 
+    /// Перелёт всегда выводит корабль на ОСВЕЩЁННУЮ сторону планеты (возле терминатора)
     func warpToBody(_ body: CelestialBody) {
         targetBody = body
         throttle = 0
         shipVelocityMetersPerSec = .zero
         let bodyPos = body.currentPosition(simulationTime: simulationTimeSeconds, allBodies: UniverseCatalog.bodies)
-        let orbitDist = body.radiusMeters * (body.id == "sgr_a" ? 5.5 : 2.9)
-        shipPositionMeters = bodyPos + SIMD3<Double>(orbitDist * 0.6, orbitDist * 0.25, orbitDist * 0.75)
+        let orbitDist = body.radiusMeters * (body.id == "sgr_a" ? 5.8 : 2.9)
+
+        let offsetDir: SIMD3<Double>
+        if body.isStar || simd_length(bodyPos) < 1_000 {
+            offsetDir = simd_normalize(SIMD3<Double>(0.6, 0.25, 0.75))
+        } else {
+            let toSun = simd_normalize(-bodyPos)
+            let right = simd_normalize(simd_cross(SIMD3<Double>(0, 1, 0), toSun))
+            offsetDir = simd_normalize(toSun * 0.74 + right * 0.62 + SIMD3<Double>(0, 0.20, 0))
+        }
+
+        shipPositionMeters = bodyPos + offsetDir * orbitDist
         alignToTarget()
     }
 
@@ -812,7 +821,6 @@ final class SpaceSimulationController: ObservableObject {
         let lookTarget = SIMD3<Float>(Float(-sunDirWorld.x), Float(-sunDirWorld.y), Float(-sunDirWorld.z))
         sunLightNode.simdLook(at: lookTarget, up: SIMD3<Float>(0, 1, 0), localFront: SIMD3<Float>(0, 0, -1))
 
-        // Инверсная ориентация камеры для расчёта направления на Солнце в View Space (для атмосферы)
         let camWorldQuat = cameraNode.simdWorldOrientation
         let invCamQuat = simd_inverse(camWorldQuat)
 
@@ -841,13 +849,11 @@ final class SpaceSimulationController: ObservableObject {
                 let toSunWorld = simd_normalize(-bodyPos)
                 let toSunF = SIMD3<Float>(Float(toSunWorld.x), Float(toSunWorld.y), Float(toSunWorld.z))
 
-                // Переводим вектор Солнца в локальную систему координат вращающейся планеты (для огней городов и дымки)
                 let invTilt = simd_quatf(angle: -Float(body.axialTiltRad), axis: SIMD3<Float>(0, 0, 1))
                 let invSpin = simd_quatf(angle: -spinAngle, axis: SIMD3<Float>(0, 1, 0))
                 let sunLocal = (invSpin * invTilt).act(toSunF)
                 planetMaterials[body.id]?.setValue(NSValue(scnVector3: SCNVector3(sunLocal.x, sunLocal.y, sunLocal.z)), forKey: "sunDirLocal")
 
-                // Переводим вектор Солнца в View Space камеры (для атмосферы)
                 let sunView = invCamQuat.act(toSunF)
                 atmoMaterials[body.id]?.setValue(NSValue(scnVector3: SCNVector3(sunView.x, sunView.y, sunView.z)), forKey: "sunDirView")
             }
