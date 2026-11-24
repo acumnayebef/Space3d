@@ -14,11 +14,15 @@ struct CelestialBody: Identifiable {
     let massKg: Double
     let axialTiltRad: Double
     let rotationPeriodSeconds: Double
+    let meanTempK: Int                // Средняя температура (Кельвины)
     let colorHex: UInt32
     let secondaryHex: UInt32
     let isStar: Bool
     let hasAtmosphere: Bool
     let hasRings: Bool
+    let summary: String
+
+    static let G: Double = 6.67430e-11
 
     /// Текущая 3D-позиция в метрах в гелиоцентрической системе координат (1:1)
     func currentPosition(simulationTime: Double, allBodies: [CelestialBody]) -> SIMD3<Double> {
@@ -48,9 +52,34 @@ struct CelestialBody: Identifiable {
         return parentPos + SIMD3<Double>(x, y, z)
     }
 
-    func orbitalVelocity(atRadius r: Double) -> Double {
-        let g = 6.67430e-11
-        return sqrt((g * massKg) / max(radiusMeters, r))
+    /// Позиция точки на орбите по углу (для отрисовки 3D-линий орбит)
+    func orbitPoint(angle: Double, parentPos: SIMD3<Double>) -> SIMD3<Double> {
+        let cosLat = cos(latitudeRad)
+        let x = cos(angle) * cosLat * semiMajorAxisMeters
+        let y = sin(latitudeRad) * semiMajorAxisMeters
+        let z = -sin(angle) * cosLat * semiMajorAxisMeters
+        return parentPos + SIMD3<Double>(x, y, z)
+    }
+
+    /// Гравитация на поверхности в единицах g
+    var surfaceGravityG: Double {
+        let gSurface = (Self.G * massKg) / (radiusMeters * radiusMeters)
+        return gSurface / 9.80665
+    }
+
+    /// Первая космическая скорость у поверхности (м/с)
+    var firstCosmicVelocityMps: Double {
+        sqrt((Self.G * massKg) / radiusMeters)
+    }
+
+    /// Вторая космическая скорость / скорость убегания (м/с)
+    var escapeVelocityMps: Double {
+        sqrt((2.0 * Self.G * massKg) / radiusMeters)
+    }
+
+    /// Температура в градусах Цельсия
+    var meanTempC: Int {
+        meanTempK - 273
     }
 }
 
@@ -60,19 +89,19 @@ final class UniverseCatalog {
     static let day: Double = 86_400.0
 
     static let bodies: [CelestialBody] = [
-        CelestialBody(id: "sun", name: "Солнце", type: "Звезда G2V", semiMajorAxisMeters: 0, orbitalPeriodSeconds: 0, initialPhaseRad: 0, latitudeRad: 0, parentId: nil, radiusMeters: 696_340_000, massKg: 1.9885e30, axialTiltRad: 0.126, rotationPeriodSeconds: 25.38 * day, colorHex: 0xFFCC44, secondaryHex: 0xFF6600, isStar: true, hasAtmosphere: false, hasRings: false),
-        CelestialBody(id: "mercury", name: "Меркурий", type: "Планета", semiMajorAxisMeters: 0.387098 * au, orbitalPeriodSeconds: 87.969 * day, initialPhaseRad: 0.4, latitudeRad: 0.05, parentId: "sun", radiusMeters: 2_439_700, massKg: 3.3011e23, axialTiltRad: 0.0005, rotationPeriodSeconds: 58.646 * day, colorHex: 0x948F88, secondaryHex: 0x524E48, isStar: false, hasAtmosphere: false, hasRings: false),
-        CelestialBody(id: "venus", name: "Венера", type: "Планета", semiMajorAxisMeters: 0.723332 * au, orbitalPeriodSeconds: 224.701 * day, initialPhaseRad: 2.1, latitudeRad: -0.02, parentId: "sun", radiusMeters: 6_051_800, massKg: 4.8675e24, axialTiltRad: 3.095, rotationPeriodSeconds: -243.025 * day, colorHex: 0xE6B87D, secondaryHex: 0xB87A38, isStar: false, hasAtmosphere: true, hasRings: false),
-        CelestialBody(id: "earth", name: "Земля", type: "Планета", semiMajorAxisMeters: 1.000000 * au, orbitalPeriodSeconds: 365.256 * day, initialPhaseRad: .pi, latitudeRad: 0, parentId: "sun", radiusMeters: 6_371_000, massKg: 5.97237e24, axialTiltRad: 0.4091, rotationPeriodSeconds: 86_164.1, colorHex: 0x164E9C, secondaryHex: 0x3B8C4E, isStar: false, hasAtmosphere: true, hasRings: false),
-        CelestialBody(id: "moon", name: "Луна", type: "Спутник Земли", semiMajorAxisMeters: 384_400_000, orbitalPeriodSeconds: 27.32166 * day, initialPhaseRad: 0.85, latitudeRad: 0.089, parentId: "earth", radiusMeters: 1_737_400, massKg: 7.342e22, axialTiltRad: 0.116, rotationPeriodSeconds: 27.32166 * day, colorHex: 0xC4C4C4, secondaryHex: 0x6A6A6A, isStar: false, hasAtmosphere: false, hasRings: false),
-        CelestialBody(id: "mars", name: "Марс", type: "Планета", semiMajorAxisMeters: 1.523679 * au, orbitalPeriodSeconds: 686.980 * day, initialPhaseRad: 1.3, latitudeRad: 0.02, parentId: "sun", radiusMeters: 3_389_500, massKg: 6.4171e23, axialTiltRad: 0.4396, rotationPeriodSeconds: 88_642.6, colorHex: 0xC8522E, secondaryHex: 0x692311, isStar: false, hasAtmosphere: true, hasRings: false),
-        CelestialBody(id: "jupiter", name: "Юпитер", type: "Газовый гигант", semiMajorAxisMeters: 5.2044 * au, orbitalPeriodSeconds: 4332.59 * day, initialPhaseRad: 5.2, latitudeRad: -0.01, parentId: "sun", radiusMeters: 69_911_000, massKg: 1.8982e27, axialTiltRad: 0.0546, rotationPeriodSeconds: 35_730, colorHex: 0xD8B088, secondaryHex: 0x8F5230, isStar: false, hasAtmosphere: true, hasRings: false),
-        CelestialBody(id: "saturn", name: "Сатурн", type: "Газовый гигант", semiMajorAxisMeters: 9.5826 * au, orbitalPeriodSeconds: 10759.22 * day, initialPhaseRad: 3.7, latitudeRad: 0.03, parentId: "sun", radiusMeters: 58_232_000, massKg: 5.6834e26, axialTiltRad: 0.4665, rotationPeriodSeconds: 38_362, colorHex: 0xE8D49E, secondaryHex: 0xB39252, isStar: false, hasAtmosphere: true, hasRings: true),
-        CelestialBody(id: "uranus", name: "Уран", type: "Ледяной гигант", semiMajorAxisMeters: 19.2184 * au, orbitalPeriodSeconds: 30688.5 * day, initialPhaseRad: 4.5, latitudeRad: -0.01, parentId: "sun", radiusMeters: 25_362_000, massKg: 8.6810e25, axialTiltRad: 1.706, rotationPeriodSeconds: -62_064, colorHex: 0x84E6F5, secondaryHex: 0x4CB3C9, isStar: false, hasAtmosphere: true, hasRings: true),
-        CelestialBody(id: "neptune", name: "Нептун", type: "Ледяной гигант", semiMajorAxisMeters: 30.11 * au, orbitalPeriodSeconds: 60195.0 * day, initialPhaseRad: 0.2, latitudeRad: 0.02, parentId: "sun", radiusMeters: 24_622_000, massKg: 1.02413e26, axialTiltRad: 0.494, rotationPeriodSeconds: 57_996, colorHex: 0x3666FF, secondaryHex: 0x1A3494, isStar: false, hasAtmosphere: true, hasRings: false),
-        CelestialBody(id: "proxima", name: "Проксима Центавра", type: "Звезда M5.5Ve", semiMajorAxisMeters: 4.2465 * ly, orbitalPeriodSeconds: 0, initialPhaseRad: 2.3, latitudeRad: -0.78, parentId: nil, radiusMeters: 107_280_000, massKg: 2.428e29, axialTiltRad: 0, rotationPeriodSeconds: 83.5 * day, colorHex: 0xFF5A36, secondaryHex: 0xB8250A, isStar: true, hasAtmosphere: false, hasRings: false),
-        CelestialBody(id: "sirius", name: "Сириус A", type: "Звезда A1V", semiMajorAxisMeters: 8.60 * ly, orbitalPeriodSeconds: 0, initialPhaseRad: 1.7, latitudeRad: -0.29, parentId: nil, radiusMeters: 1_190_000_000, massKg: 4.018e30, axialTiltRad: 0, rotationPeriodSeconds: 5.5 * day, colorHex: 0xD6EAFF, secondaryHex: 0x88B8FF, isStar: true, hasAtmosphere: false, hasRings: false),
-        CelestialBody(id: "trappist1", name: "TRAPPIST-1", type: "Система (7 экзопланет)", semiMajorAxisMeters: 39.46 * ly, orbitalPeriodSeconds: 0, initialPhaseRad: 5.8, latitudeRad: -0.09, parentId: nil, radiusMeters: 84_180_000, massKg: 1.787e29, axialTiltRad: 0, rotationPeriodSeconds: 3.3 * day, colorHex: 0xFF4522, secondaryHex: 0x991A00, isStar: true, hasAtmosphere: false, hasRings: false),
-        CelestialBody(id: "sgr_a", name: "Стрелец A*", type: "Сверхмассивная ЧД", semiMajorAxisMeters: 26_673.0 * ly, orbitalPeriodSeconds: 0, initialPhaseRad: 4.1, latitudeRad: -0.50, parentId: nil, radiusMeters: 12_000_000_000, massKg: 8.26e36, axialTiltRad: 0.4, rotationPeriodSeconds: 600, colorHex: 0x000000, secondaryHex: 0xFF8811, isStar: true, hasAtmosphere: false, hasRings: true)
+        CelestialBody(id: "sun", name: "Солнце", type: "Звезда G2V", semiMajorAxisMeters: 0, orbitalPeriodSeconds: 0, initialPhaseRad: 0, latitudeRad: 0, parentId: nil, radiusMeters: 696_340_000, massKg: 1.9885e30, axialTiltRad: 0.126, rotationPeriodSeconds: 25.38 * day, meanTempK: 5778, colorHex: 0xFFCC44, secondaryHex: 0xFF6600, isStar: true, hasAtmosphere: false, hasRings: false, summary: "Жёлтый карлик главной последовательности, содержащий 99.86% массы Солнечной системы."),
+        CelestialBody(id: "mercury", name: "Меркурий", type: "Планета земной группы", semiMajorAxisMeters: 0.387098 * au, orbitalPeriodSeconds: 87.969 * day, initialPhaseRad: 0.4, latitudeRad: 0.05, parentId: "sun", radiusMeters: 2_439_700, massKg: 3.3011e23, axialTiltRad: 0.0005, rotationPeriodSeconds: 58.646 * day, meanTempK: 440, colorHex: 0x948F88, secondaryHex: 0x524E48, isStar: false, hasAtmosphere: false, hasRings: false, summary: "Ближайшая к Солнцу и самая маленькая планета системы с огромным железным ядром."),
+        CelestialBody(id: "venus", name: "Венера", type: "Планета земной группы", semiMajorAxisMeters: 0.723332 * au, orbitalPeriodSeconds: 224.701 * day, initialPhaseRad: 2.1, latitudeRad: -0.02, parentId: "sun", radiusMeters: 6_051_800, massKg: 4.8675e24, axialTiltRad: 3.095, rotationPeriodSeconds: -243.025 * day, meanTempK: 737, colorHex: 0xE6B87D, secondaryHex: 0xB87A38, isStar: false, hasAtmosphere: true, hasRings: false, summary: "Плотная углекислотная атмосфера создаёт экстремальный парниковый эффект и давление 92 атм."),
+        CelestialBody(id: "earth", name: "Земля", type: "Обитаемая планета", semiMajorAxisMeters: 1.000000 * au, orbitalPeriodSeconds: 365.256 * day, initialPhaseRad: .pi, latitudeRad: 0, parentId: "sun", radiusMeters: 6_371_000, massKg: 5.97237e24, axialTiltRad: 0.4091, rotationPeriodSeconds: 86_164.1, meanTempK: 288, colorHex: 0x164E9C, secondaryHex: 0x3B8C4E, isStar: false, hasAtmosphere: true, hasRings: false, summary: "Единственное известное небесное тело с жидкой водой на поверхности и развитой биосферой."),
+        CelestialBody(id: "moon", name: "Луна", type: "Спутник Земли", semiMajorAxisMeters: 384_400_000, orbitalPeriodSeconds: 27.32166 * day, initialPhaseRad: 0.85, latitudeRad: 0.089, parentId: "earth", radiusMeters: 1_737_400, massKg: 7.342e22, axialTiltRad: 0.116, rotationPeriodSeconds: 27.32166 * day, meanTempK: 220, colorHex: 0xC4C4C4, secondaryHex: 0x6A6A6A, isStar: false, hasAtmosphere: false, hasRings: false, summary: "Естественный спутник Земли, находящийся в приливном захвате."),
+        CelestialBody(id: "mars", name: "Марс", type: "Планета земной группы", semiMajorAxisMeters: 1.523679 * au, orbitalPeriodSeconds: 686.980 * day, initialPhaseRad: 1.3, latitudeRad: 0.02, parentId: "sun", radiusMeters: 3_389_500, massKg: 6.4171e23, axialTiltRad: 0.4396, rotationPeriodSeconds: 88_642.6, meanTempK: 210, colorHex: 0xC8522E, secondaryHex: 0x692311, isStar: false, hasAtmosphere: true, hasRings: false, summary: "Холодная пустынная планета с разреженной атмосферой и крупнейшим вулканом Олимп."),
+        CelestialBody(id: "jupiter", name: "Юпитер", type: "Газовый гигант", semiMajorAxisMeters: 5.2044 * au, orbitalPeriodSeconds: 4332.59 * day, initialPhaseRad: 5.2, latitudeRad: -0.01, parentId: "sun", radiusMeters: 69_911_000, massKg: 1.8982e27, axialTiltRad: 0.0546, rotationPeriodSeconds: 35_730, meanTempK: 165, colorHex: 0xD8B088, secondaryHex: 0x8F5230, isStar: false, hasAtmosphere: true, hasRings: false, summary: "Крупнейшая планета Солнечной системы с мощнейшим магнитным полем и ураганами."),
+        CelestialBody(id: "saturn", name: "Сатурн", type: "Газовый гигант", semiMajorAxisMeters: 9.5826 * au, orbitalPeriodSeconds: 10759.22 * day, initialPhaseRad: 3.7, latitudeRad: 0.03, parentId: "sun", radiusMeters: 58_232_000, massKg: 5.6834e26, axialTiltRad: 0.4665, rotationPeriodSeconds: 38_362, meanTempK: 134, colorHex: 0xE8D49E, secondaryHex: 0xB39252, isStar: false, hasAtmosphere: true, hasRings: true, summary: "Обладает самой развитой системой ледяных колец и средней плотностью ниже воды."),
+        CelestialBody(id: "uranus", name: "Уран", type: "Ледяной гигант", semiMajorAxisMeters: 19.2184 * au, orbitalPeriodSeconds: 30688.5 * day, initialPhaseRad: 4.5, latitudeRad: -0.01, parentId: "sun", radiusMeters: 25_362_000, massKg: 8.6810e25, axialTiltRad: 1.706, rotationPeriodSeconds: -62_064, meanTempK: 76, colorHex: 0x84E6F5, secondaryHex: 0x4CB3C9, isStar: false, hasAtmosphere: true, hasRings: true, summary: "Вращается практически «лёжа на боку» с наклоном оси 97.7° и тонкими тёмными кольцами."),
+        CelestialBody(id: "neptune", name: "Нептун", type: "Ледяной гигант", semiMajorAxisMeters: 30.11 * au, orbitalPeriodSeconds: 60195.0 * day, initialPhaseRad: 0.2, latitudeRad: 0.02, parentId: "sun", radiusMeters: 24_622_000, massKg: 1.02413e26, axialTiltRad: 0.494, rotationPeriodSeconds: 57_996, meanTempK: 72, colorHex: 0x3666FF, secondaryHex: 0x1A3494, isStar: false, hasAtmosphere: true, hasRings: false, summary: "Самая далёкая планета системы со сверхзвуковыми ветрами до 2100 км/ч."),
+        CelestialBody(id: "proxima", name: "Проксима Центавра", type: "Звезда M5.5Ve", semiMajorAxisMeters: 4.2465 * ly, orbitalPeriodSeconds: 0, initialPhaseRad: 2.3, latitudeRad: -0.78, parentId: nil, radiusMeters: 107_280_000, massKg: 2.428e29, axialTiltRad: 0, rotationPeriodSeconds: 83.5 * day, meanTempK: 3042, colorHex: 0xFF5A36, secondaryHex: 0xB8250A, isStar: true, hasAtmosphere: false, hasRings: false, summary: "Ближайшая к Солнцу звезда — красный карлик с подтверждённой экзопланетой Proxima b."),
+        CelestialBody(id: "sirius", name: "Сириус A", type: "Звезда A1V", semiMajorAxisMeters: 8.60 * ly, orbitalPeriodSeconds: 0, initialPhaseRad: 1.7, latitudeRad: -0.29, parentId: nil, radiusMeters: 1_190_000_000, massKg: 4.018e30, axialTiltRad: 0, rotationPeriodSeconds: 5.5 * day, meanTempK: 9940, colorHex: 0xD6EAFF, secondaryHex: 0x88B8FF, isStar: true, hasAtmosphere: false, hasRings: false, summary: "Ярчайшая звезда земного ночного неба, в 25 раз превосходящая Солнце по светимости."),
+        CelestialBody(id: "trappist1", name: "TRAPPIST-1", type: "Система (7 экзопланет)", semiMajorAxisMeters: 39.46 * ly, orbitalPeriodSeconds: 0, initialPhaseRad: 5.8, latitudeRad: -0.09, parentId: nil, radiusMeters: 84_180_000, massKg: 1.787e29, axialTiltRad: 0, rotationPeriodSeconds: 3.3 * day, meanTempK: 2566, colorHex: 0xFF4522, secondaryHex: 0x991A00, isStar: true, hasAtmosphere: false, hasRings: false, summary: "Ультрахолодный карлик в созвездии Водолея, вокруг которого вращаются 7 землеподобных планет."),
+        CelestialBody(id: "sgr_a", name: "Стрелец A*", type: "Сверхмассивная ЧД", semiMajorAxisMeters: 26_673.0 * ly, orbitalPeriodSeconds: 0, initialPhaseRad: 4.1, latitudeRad: -0.50, parentId: nil, radiusMeters: 12_000_000_000, massKg: 8.26e36, axialTiltRad: 0.4, rotationPeriodSeconds: 600, meanTempK: 0, colorHex: 0x000000, secondaryHex: 0xFF8811, isStar: true, hasAtmosphere: false, hasRings: true, summary: "Сверхмассивная чёрная дыра в центре Млечного Пути массой ~4.15 млн масс Солнца.")
     ]
 }

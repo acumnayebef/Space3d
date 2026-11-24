@@ -13,6 +13,16 @@ struct SpaceSimApp: App {
     }
 }
 
+struct BodyScreenMarker: Identifiable {
+    let id: String
+    let name: String
+    let x: CGFloat
+    let y: CGFloat
+    let color: Color
+    let isTarget: Bool
+    let isStar: Bool
+}
+
 final class SpaceSimulationController: ObservableObject {
     let scene = SCNScene()
     let shipNode = SCNNode()
@@ -25,6 +35,7 @@ final class SpaceSimulationController: ObservableObject {
     let cameraNode = SCNNode()
     let sunLightNode = SCNNode()
     let dustRootNode = SCNNode()
+    let orbitLinesNode = SCNNode()
 
     var exhaustNodes: [SCNNode] = []
     var dustParticles: [(node: SCNNode, offset: SIMD3<Float>)] = []
@@ -43,16 +54,23 @@ final class SpaceSimulationController: ObservableObject {
     var cameraLagYaw: Float = 0.0
     var cameraLagPitch: Float = 0.0
 
+    let baseEpochDate = Date()
     var simulationTimeSeconds: Double = 0.0
 
     @Published var speedIndex: Int = 0
     @Published var timeWarpIndex: Int = 0
+    @Published var isTimePaused: Bool = false
+    @Published var isTimeReversed: Bool = false
+    @Published var showOrbits: Bool = true
+    @Published var showMarkers: Bool = true
     @Published var throttle: Double = 0.0
     @Published var flightAssist: Bool = true
     @Published var targetBody: CelestialBody = UniverseCatalog.bodies[3]
     @Published var distanceText: String = "10.2 тыс. км"
     @Published var speedText: String = "0 м/с"
     @Published var etaText: String = "Стоп"
+    @Published var simDateText: String = ""
+    @Published var screenMarkers: [BodyScreenMarker] = []
     @Published var isThirdPerson: Bool = true
 
     let speedSteps: [(label: String, mps: Double)] = [
@@ -73,7 +91,8 @@ final class SpaceSimulationController: ObservableObject {
         ("100x", 100),
         ("1 000x", 1_000),
         ("10 000x", 10_000),
-        ("100 000x", 100_000)
+        ("100 000x", 100_000),
+        ("1 млн x", 1_000_000)
     ]
 
     private var bodyNodes: [String: SCNNode] = [:]
@@ -81,6 +100,14 @@ final class SpaceSimulationController: ObservableObject {
     private var planetMaterials: [String: SCNMaterial] = [:]
     private var atmoMaterials: [String: SCNMaterial] = [:]
     private var lastUpdateTime: TimeInterval = 0
+    private var frameCounter: Int = 0
+
+    private static let dateFormatter: DateFormatter = {
+        let df = DateFormatter()
+        df.dateFormat = "dd.MM.yyyy HH:mm"
+        return df
+    }()
+
     private lazy var whitePixel: UIImage = {
         let r = UIGraphicsImageRenderer(size: CGSize(width: 2, height: 2))
         return r.image { ctx in
@@ -89,7 +116,17 @@ final class SpaceSimulationController: ObservableObject {
         }
     }()
 
+    private lazy var orbitLineMaterial: SCNMaterial = {
+        let mat = SCNMaterial()
+        mat.lightingModel = .constant
+        mat.diffuse.contents = UIColor(red: 0.25, green: 0.72, blue: 1.0, alpha: 0.42)
+        mat.blendMode = .add
+        mat.writesToDepthBuffer = false
+        return mat
+    }()
+
     init() {
+        simDateText = Self.dateFormatter.string(from: baseEpochDate)
         setupScene()
     }
 
@@ -127,6 +164,7 @@ final class SpaceSimulationController: ObservableObject {
         cameraBoomNode.addChildNode(cameraNode)
         updateCameraMode()
 
+        scene.rootNode.addChildNode(orbitLinesNode)
         buildSpaceDust()
         buildCelestialBodies()
     }
@@ -275,6 +313,59 @@ final class SpaceSimulationController: ObservableObject {
             scene.rootNode.addChildNode(root)
             bodyNodes[body.id] = root
         }
+    }
+
+    /// Преобразование 64-битных мировых координат в 3D-позицию сцены без Z-fighting
+    private func compressToScene(_ relMeters: SIMD3<Double>) -> (pos: SIMD3<Float>, scaleFactor: Double) {
+        let dist = simd_length(relMeters)
+        let maxRenderDist = 420_000.0
+        if dist <= maxRenderDist || dist < 1e-6 {
+            return (SIMD3<Float>(Float(relMeters.x), Float(relMeters.y), Float(relMeters.z)), 1.0)
+        }
+        // Плавное логарифмическое смещение глубины, чтобы далёкие звёзды всегда были позади ближних планет
+        let compressedDist = maxRenderDist * (1.0 + 0.045 * log10(dist / maxRenderDist))
+        let scaleFactor = compressedDist / dist
+        let rPos = relMeters * scaleFactor
+        return (SIMD3<Float>(Float(rPos.x), Float(rPos.y), Float(rPos.z)), scaleFactor)
+    }
+
+    /// Обновление 3D-линий орбит всех планет и Луны в одном батче
+    private func updateOrbitLines() {
+        orbitLinesNode.isHidden = !showOrbits
+        guard showOrbits else { return }
+
+        var vertices: [SCNVector3] = []
+        var indices: [Int32] = []
+        let segments = 72
+        vertices.reserveCapacity(10 * segments)
+        indices.reserveCapacity(10 * segments * 2)
+
+        for body in UniverseCatalog.bodies where body.semiMajorAxisMeters > 0 && body.orbitalPeriodSeconds > 0 {
+            let parentPos: SIMD3<Double>
+            if let pid = body.parentId, let parent = UniverseCatalog.bodies.first(where: { $0.id == pid }) {
+                parentPos = parent.currentPosition(simulationTime: simulationTimeSeconds, allBodies: UniverseCatalog.bodies)
+            } else {
+                parentPos = .zero
+            }
+
+            let baseIndex = Int32(vertices.count)
+            for s in 0..<segments {
+                let angle = (Double(s) / Double(segments)) * 2.0 * .pi
+                let ptWorld = body.orbitPoint(angle: angle, parentPos: parentPos)
+                let (pos, _) = compressToScene(ptWorld - shipPositionMeters)
+                vertices.append(SCNVector3(pos.x, pos.y, pos.z))
+
+                let next = (s + 1) % segments
+                indices.append(baseIndex + Int32(s))
+                indices.append(baseIndex + Int32(next))
+            }
+        }
+
+        let source = SCNGeometrySource(vertices: vertices)
+        let element = SCNGeometryElement(indices: indices, primitiveType: .line)
+        let geometry = SCNGeometry(sources: [source], elements: [element])
+        geometry.materials = [orbitLineMaterial]
+        orbitLinesNode.geometry = geometry
     }
 
     private func planetShaderModifier(for body: CelestialBody) -> String {
@@ -549,7 +640,6 @@ final class SpaceSimulationController: ObservableObject {
         }
     }
 
-    // Детализированный 3D-кокпит в стиле Elite Dangerous (МФД-экраны, 3D-радар, живой HOTAS, верхняя панель)
     private func buildFirstPersonCockpit() {
         let darkMetal = SCNMaterial()
         darkMetal.lightingModel = .physicallyBased
@@ -575,7 +665,6 @@ final class SpaceSimulationController: ObservableObject {
         neonGreen.lightingModel = .constant
         neonGreen.diffuse.contents = UIColor(red: 0.20, green: 0.95, blue: 0.45, alpha: 1.0)
 
-        // Внутренняя мягкая подсветка кабины, чтобы металлические грани переливались
         let cabinLight = SCNLight()
         cabinLight.type = .omni
         cabinLight.intensity = 180
@@ -587,7 +676,6 @@ final class SpaceSimulationController: ObservableObject {
         lightNode.position = SCNVector3(0, 0.15, -0.35)
         cockpitMeshNode.addChildNode(lightNode)
 
-        // 1. Многоуровневая приборная панель (торпеда + центральный козырёк)
         let mainDash = SCNBox(width: 2.3, height: 0.28, length: 0.65, chamferRadius: 0.03)
         mainDash.materials = [darkMetal]
         let dashNode = SCNNode(geometry: mainDash)
@@ -602,14 +690,12 @@ final class SpaceSimulationController: ObservableObject {
         hoodNode.eulerAngles.x = 0.15
         cockpitMeshNode.addChildNode(hoodNode)
 
-        // Оранжевая и голубая неоновые линии вдоль кромки торпеды
         let trimCyan = SCNBox(width: 1.95, height: 0.008, length: 0.015, chamferRadius: 0.003)
         trimCyan.materials = [neonCyan]
         let trimNode = SCNNode(geometry: trimCyan)
         trimNode.position = SCNVector3(0, -0.42, -0.58)
         cockpitMeshNode.addChildNode(trimNode)
 
-        // 2. Левый и правый МФД-экраны с процедурной графикой (щиты/системы и орбитальный сканер)
         let leftScreen = SCNPlane(width: 0.38, height: 0.19)
         let leftMat = SCNMaterial()
         leftMat.lightingModel = .constant
@@ -630,7 +716,6 @@ final class SpaceSimulationController: ObservableObject {
         rightMfd.eulerAngles = SCNVector3(-0.34, -0.24, 0)
         cockpitMeshNode.addChildNode(rightMfd)
 
-        // 3. 3D-голографический радар по центру консоли (вращающиеся кольца)
         let radarGroup = SCNNode()
         radarGroup.position = SCNVector3(0, -0.35, -0.68)
         radarGroup.eulerAngles.x = 0.22
@@ -652,7 +737,7 @@ final class SpaceSimulationController: ObservableObject {
             ring.materials = [idx == 1 ? holoCyanMat : holoMat]
             radarGroup.addChildNode(SCNNode(geometry: ring))
         }
-        // Центральный маркер корабля на радаре
+
         let shipIcon = SCNPyramid(width: 0.022, height: 0.032, length: 0.012)
         shipIcon.materials = [holoCyanMat]
         let iconNode = SCNNode(geometry: shipIcon)
@@ -660,7 +745,6 @@ final class SpaceSimulationController: ObservableObject {
         iconNode.position = SCNVector3(0, 0.01, 0)
         radarGroup.addChildNode(iconNode)
 
-        // Сканирующая перекладина радара
         let sweep = SCNBox(width: 0.26, height: 0.002, length: 0.003, chamferRadius: 0)
         sweep.materials = [holoMat]
         let sweepNode = SCNNode(geometry: sweep)
@@ -668,7 +752,6 @@ final class SpaceSimulationController: ObservableObject {
         radarGroup.addChildNode(sweepNode)
         cockpitMeshNode.addChildNode(radarGroup)
 
-        // 4. Живые органы управления HOTAS (РУД слева, РУС/джойстик справа)
         cockpitThrottlePivot.position = SCNVector3(-0.62, -0.48, -0.50)
         let throttleArm = SCNBox(width: 0.035, height: 0.12, length: 0.03, chamferRadius: 0.006)
         throttleArm.materials = [lightMetal]
@@ -709,7 +792,6 @@ final class SpaceSimulationController: ObservableObject {
         cockpitStickPivot.addChildNode(trigNode)
         cockpitMeshNode.addChildNode(cockpitStickPivot)
 
-        // 5. Гранёный переплёт фонаря кабины и верхняя панель статуса
         for side in [-1.0, 1.0] {
             let mainStrut = SCNBox(width: 0.048, height: 1.25, length: 0.055, chamferRadius: 0.01)
             mainStrut.materials = [darkMetal]
@@ -733,7 +815,6 @@ final class SpaceSimulationController: ObservableObject {
             cockpitMeshNode.addChildNode(lNode)
         }
 
-        // Верхняя консоль с индикаторами систем
         let topBar = SCNBox(width: 1.44, height: 0.06, length: 0.12, chamferRadius: 0.012)
         topBar.materials = [darkMetal]
         let topNode = SCNNode(geometry: topBar)
@@ -749,7 +830,6 @@ final class SpaceSimulationController: ObservableObject {
             cockpitMeshNode.addChildNode(ledNode)
         }
 
-        // 6. Голографический прицел (коллиматор с боковыми дугами тангажа)
         let hudGroup = SCNNode()
         hudGroup.position = SCNVector3(0, 0.02, -0.95)
 
@@ -789,7 +869,6 @@ final class SpaceSimulationController: ObservableObject {
             ctx.setFillColor(UIColor(red: 0.02, green: 0.06, blue: 0.10, alpha: 0.96).cgColor)
             ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
 
-            // Рамка и сетка дисплея
             let cyan = UIColor(red: 0.05, green: 0.86, blue: 1.0, alpha: 1.0)
             let orange = UIColor(red: 1.0, green: 0.52, blue: 0.12, alpha: 1.0)
             ctx.setStrokeColor(cyan.withAlphaComponent(0.65).cgColor)
@@ -809,14 +888,12 @@ final class SpaceSimulationController: ObservableObject {
             ctx.strokePath()
 
             if isLeft {
-                // Схема щитов и корпуса корабля
                 let cx: CGFloat = 135, cy: CGFloat = 128
                 for r in [76, 62, 48] {
                     ctx.setStrokeColor(cyan.withAlphaComponent(r == 76 ? 0.9 : 0.45).cgColor)
                     ctx.setLineWidth(r == 76 ? 4 : 2)
                     ctx.strokeEllipse(in: CGRect(x: cx - CGFloat(r), y: cy - CGFloat(r), width: CGFloat(r * 2), height: CGFloat(r * 2)))
                 }
-                // Силуэт звездолёта внутри щита
                 ctx.setStrokeColor(orange.cgColor)
                 ctx.setLineWidth(3)
                 ctx.move(to: CGPoint(x: cx, y: cy - 34))
@@ -826,7 +903,6 @@ final class SpaceSimulationController: ObservableObject {
                 ctx.closePath()
                 ctx.strokePath()
 
-                // Шкалы энергии SYS / ENG / WEP
                 let labels = [("SYS", 0.85, cyan), ("ENG", 0.95, orange), ("WEP", 0.65, cyan)]
                 for (i, item) in labels.enumerated() {
                     let y = CGFloat(54 + i * 58)
@@ -836,7 +912,6 @@ final class SpaceSimulationController: ObservableObject {
                     ctx.fill(CGRect(x: 260, y: y, width: CGFloat(215.0 * item.1), height: 24))
                 }
             } else {
-                // Правый экран: орбитальная диаграмма и спектр сканера
                 let cx: CGFloat = 370, cy: CGFloat = 128
                 ctx.setStrokeColor(orange.withAlphaComponent(0.8).cgColor)
                 ctx.setLineWidth(2.5)
@@ -848,7 +923,6 @@ final class SpaceSimulationController: ObservableObject {
                 ctx.setFillColor(cyan.cgColor)
                 ctx.fillEllipse(in: CGRect(x: cx + 82, y: cy - 16, width: 12, height: 12))
 
-                // Волна FSS-сканера слева
                 ctx.setStrokeColor(cyan.cgColor)
                 ctx.setLineWidth(3)
                 ctx.move(to: CGPoint(x: 24, y: 128))
@@ -1032,12 +1106,14 @@ final class SpaceSimulationController: ObservableObject {
         alignToTarget()
     }
 
-    func stepSimulation(currentTime: TimeInterval) {
+    func stepSimulation(currentTime: TimeInterval, renderer: SCNSceneRenderer) {
         if lastUpdateTime == 0 { lastUpdateTime = currentTime }
         let realDt = min(0.05, currentTime - lastUpdateTime)
         lastUpdateTime = currentTime
+        frameCounter += 1
 
-        let warp = timeWarpSteps[timeWarpIndex].mult
+        let timeDir: Double = isTimeReversed ? -1.0 : 1.0
+        let warp = isTimePaused ? 0.0 : (timeWarpSteps[timeWarpIndex].mult * timeDir)
         let simDt = realDt * warp
         simulationTimeSeconds += simDt
 
@@ -1065,7 +1141,6 @@ final class SpaceSimulationController: ObservableObject {
         shipVisualNode.eulerAngles.z += (desiredBank - shipVisualNode.eulerAngles.z) * Float(min(1.0, realDt * 8.0))
         shipVisualNode.eulerAngles.x += (desiredPitchVis - shipVisualNode.eulerAngles.x) * Float(min(1.0, realDt * 8.0))
 
-        // Анимация живого джойстика и РУД внутри 3D-кокпита
         let targetStickX = Float(stickInput.y * 0.32)
         let targetStickZ = Float(-stickInput.x * 0.32)
         cockpitStickPivot.eulerAngles.x += (targetStickX - cockpitStickPivot.eulerAngles.x) * Float(min(1.0, realDt * 12.0))
@@ -1090,7 +1165,9 @@ final class SpaceSimulationController: ObservableObject {
             shipVelocityMetersPerSec += forwardVec * (speedSteps[speedIndex].mps * throttle * 0.25) * realDt
         }
 
-        shipPositionMeters += shipVelocityMetersPerSec * simDt
+        // Корабль может летать даже на паузе времени Вселенной (как свободный полёт в SpaceEngine)
+        let flightDt = isTimePaused ? realDt : (realDt * max(1.0, abs(warp)))
+        shipPositionMeters += shipVelocityMetersPerSec * flightDt
         let actualSpeed = simd_length(shipVelocityMetersPerSec)
 
         if actualSpeed > 1.0 {
@@ -1120,18 +1197,17 @@ final class SpaceSimulationController: ObservableObject {
         let camWorldQuat = cameraNode.simdWorldOrientation
         let invCamQuat = simd_inverse(camWorldQuat)
 
+        var newMarkers: [BodyScreenMarker] = []
+        let viewBounds = (renderer as? SCNView)?.bounds ?? CGRect(x: 0, y: 0, width: 844, height: 390)
+
         for body in UniverseCatalog.bodies {
             guard let node = bodyNodes[body.id] else { continue }
             let bodyPos = body.currentPosition(simulationTime: simulationTimeSeconds, allBodies: UniverseCatalog.bodies)
             let rel = bodyPos - shipPositionMeters
-            let dist = simd_length(rel)
-
-            let maxRenderDist = 450_000.0
-            let scaleFactor = dist > maxRenderDist ? (maxRenderDist / dist) : 1.0
-            let renderPos = rel * scaleFactor
+            let (renderPos, scaleFactor) = compressToScene(rel)
             let renderRadius = max(0.35, body.radiusMeters * scaleFactor)
 
-            node.simdPosition = SIMD3<Float>(Float(renderPos.x), Float(renderPos.y), Float(renderPos.z))
+            node.simdPosition = renderPos
             node.simdScale = SIMD3<Float>(repeating: Float(renderRadius))
 
             var spinAngle: Float = 0
@@ -1153,15 +1229,44 @@ final class SpaceSimulationController: ObservableObject {
                 let sunView = invCamQuat.act(toSunF)
                 atmoMaterials[body.id]?.setValue(NSValue(scnVector3: SCNVector3(sunView.x, sunView.y, sunView.z)), forKey: "sunDirView")
             }
+
+            // Проецируем 3D-позицию тела на экран для интерактивной метки SpaceEngine
+            if showMarkers {
+                let projected = renderer.projectPoint(node.position)
+                if projected.z > 0.0 && projected.z < 1.0 {
+                    let px = CGFloat(projected.x)
+                    let py = CGFloat(projected.y)
+                    if px >= 16 && px <= viewBounds.width - 16 && py >= 46 && py <= viewBounds.height - 64 {
+                        let col = body.isStar ? Color.yellow : (body.id == targetBody.id ? Color.cyan : Color.white)
+                        newMarkers.append(BodyScreenMarker(
+                            id: body.id,
+                            name: body.name,
+                            x: px,
+                            y: py,
+                            color: col,
+                            isTarget: body.id == targetBody.id,
+                            isStar: body.isStar
+                        ))
+                    }
+                }
+            }
+        }
+
+        // Обновляем 3D-линии орбит каждые 2 кадра (30 Гц — плавно и без нагрузки на батарею)
+        if frameCounter % 2 == 0 {
+            updateOrbitLines()
         }
 
         let targetPos = targetBody.currentPosition(simulationTime: simulationTimeSeconds, allBodies: UniverseCatalog.bodies)
         let surfaceDist = max(0, simd_length(targetPos - shipPositionMeters) - targetBody.radiusMeters)
+        let currentDateStr = Self.dateFormatter.string(from: baseEpochDate.addingTimeInterval(simulationTimeSeconds))
 
         DispatchQueue.main.async {
             self.distanceText = Self.formatDistance(surfaceDist)
             self.speedText = Self.formatSpeed(actualSpeed)
             self.etaText = actualSpeed > 1.0 ? Self.formatTime(surfaceDist / actualSpeed) : "Стоп"
+            self.simDateText = currentDateStr
+            self.screenMarkers = self.showMarkers ? newMarkers : []
         }
     }
 
@@ -1272,7 +1377,7 @@ struct SceneViewContainer: UIViewRepresentable {
         init(sim: SpaceSimulationController) { self.sim = sim }
 
         func renderer(_ renderer: SCNSceneRenderer, updateAtTime time: TimeInterval) {
-            sim.stepSimulation(currentTime: time)
+            sim.stepSimulation(currentTime: time, renderer: renderer)
         }
 
         @objc func handlePan(_ gesture: UIPanGestureRecognizer) {
@@ -1294,37 +1399,95 @@ struct SceneViewContainer: UIViewRepresentable {
 struct ContentView: View {
     @StateObject private var sim = SpaceSimulationController()
     @State private var showCatalog = false
+    @State private var showInfo = false
 
     var body: some View {
         ZStack {
             SceneViewContainer(sim: sim)
 
+            // Слой интерактивных 3D-меток SpaceEngine (тап по метке выбирает объект целью)
+            if sim.showMarkers {
+                ForEach(sim.screenMarkers) { marker in
+                    Button(action: {
+                        if let found = UniverseCatalog.bodies.first(where: { $0.id == marker.id }) {
+                            sim.targetBody = found
+                        }
+                    }) {
+                        VStack(spacing: 2) {
+                            Text(marker.name)
+                                .font(.system(size: marker.isTarget ? 11 : 10, weight: marker.isTarget ? .bold : .medium, design: .monospaced))
+                                .foregroundColor(marker.color)
+                                .padding(.horizontal, 5).padding(.vertical, 1)
+                                .background(Color.black.opacity(marker.isTarget ? 0.65 : 0.35))
+                                .cornerRadius(4)
+
+                            if marker.isTarget {
+                                RoundedRectangle(cornerRadius: 4)
+                                    .stroke(Color.cyan, lineWidth: 1.5)
+                                    .frame(width: 22, height: 22)
+                            } else {
+                                Circle()
+                                    .stroke(marker.color.opacity(0.65), lineWidth: 1)
+                                    .frame(width: 10, height: 10)
+                            }
+                        }
+                    }
+                    .position(x: marker.x, y: marker.y)
+                }
+            }
+
             VStack {
-                HStack(spacing: 8) {
-                    Button(action: { showCatalog.toggle() }) {
-                        HStack(spacing: 6) {
+                HStack(spacing: 6) {
+                    Button(action: { showCatalog.toggle(); showInfo = false }) {
+                        HStack(spacing: 5) {
                             Image(systemName: "globe.americas.fill")
                             Text("\(sim.targetBody.name) • \(sim.distanceText)")
-                                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
                         }
-                        .padding(.horizontal, 11).padding(.vertical, 7)
-                        .background(Color.black.opacity(0.70))
+                        .padding(.horizontal, 10).padding(.vertical, 6)
+                        .background(Color.black.opacity(0.72))
                         .overlay(Capsule().stroke(Color.cyan.opacity(0.45), lineWidth: 1))
                         .clipShape(Capsule())
                     }
 
-                    Text("\(sim.speedText) • ETA \(sim.etaText)")
-                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    Button(action: { showInfo.toggle(); showCatalog = false }) {
+                        Image(systemName: "info.circle.fill")
+                            .font(.system(size: 14))
+                            .padding(6)
+                            .background(showInfo ? Color.cyan.opacity(0.45) : Color.black.opacity(0.72))
+                            .clipShape(Circle())
+                    }
+
+                    Text("\(sim.speedText) • \(sim.etaText)")
+                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
                         .foregroundColor(.cyan)
-                        .padding(.horizontal, 10).padding(.vertical, 7)
-                        .background(Color.black.opacity(0.70))
+                        .padding(.horizontal, 8).padding(.vertical, 6)
+                        .background(Color.black.opacity(0.72))
                         .clipShape(Capsule())
 
                     Spacer()
 
+                    Button(action: { sim.showOrbits.toggle() }) {
+                        Text("Орбиты")
+                            .font(.system(size: 10, weight: .bold))
+                            .padding(.horizontal, 8).padding(.vertical, 6)
+                            .background(sim.showOrbits ? Color.cyan.opacity(0.35) : Color.black.opacity(0.72))
+                            .overlay(Capsule().stroke(Color.white.opacity(0.22), lineWidth: 1))
+                            .clipShape(Capsule())
+                    }
+
+                    Button(action: { sim.showMarkers.toggle() }) {
+                        Text("Метки")
+                            .font(.system(size: 10, weight: .bold))
+                            .padding(.horizontal, 8).padding(.vertical, 6)
+                            .background(sim.showMarkers ? Color.cyan.opacity(0.35) : Color.black.opacity(0.72))
+                            .overlay(Capsule().stroke(Color.white.opacity(0.22), lineWidth: 1))
+                            .clipShape(Capsule())
+                    }
+
                     Button("На цель") { sim.alignToTarget() }
-                        .font(.system(size: 11, weight: .bold))
-                        .padding(.horizontal, 10).padding(.vertical, 7)
+                        .font(.system(size: 10, weight: .bold))
+                        .padding(.horizontal, 9).padding(.vertical, 6)
                         .background(Color.blue.opacity(0.82))
                         .clipShape(Capsule())
 
@@ -1332,19 +1495,19 @@ struct ContentView: View {
                         sim.isThirdPerson.toggle()
                         sim.updateCameraMode()
                     }
-                    .font(.system(size: 11, weight: .bold))
-                    .padding(.horizontal, 10).padding(.vertical, 7)
-                    .background(Color.black.opacity(0.70))
+                    .font(.system(size: 10, weight: .bold))
+                    .padding(.horizontal, 9).padding(.vertical, 6)
+                    .background(Color.black.opacity(0.72))
                     .overlay(Capsule().stroke(Color.white.opacity(0.25), lineWidth: 1))
                     .clipShape(Capsule())
                 }
                 .foregroundColor(.white)
-                .padding(.horizontal, 14)
+                .padding(.horizontal, 12)
                 .padding(.top, 10)
 
                 Spacer()
 
-                HStack(alignment: .bottom, spacing: 12) {
+                HStack(alignment: .bottom, spacing: 10) {
                     VirtualFlightStick { pt in
                         sim.stickInput = pt
                     }
@@ -1352,60 +1515,85 @@ struct ContentView: View {
                     VStack(alignment: .leading, spacing: 5) {
                         HStack {
                             Text("ТЯГА: \(Int(sim.throttle * 100))%")
-                                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                .font(.system(size: 10, weight: .bold, design: .monospaced))
                                 .foregroundColor(.cyan)
                             Spacer()
                             Button(sim.flightAssist ? "FA: ON" : "ИНЕРЦИЯ") {
                                 sim.flightAssist.toggle()
                             }
-                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                            .font(.system(size: 9, weight: .bold, design: .monospaced))
                             .padding(.horizontal, 6).padding(.vertical, 2)
                             .background(sim.flightAssist ? Color.green.opacity(0.35) : Color.orange.opacity(0.5))
                             .cornerRadius(6)
                         }
                         Slider(value: $sim.throttle, in: 0...1)
-                            .frame(width: 150)
+                            .frame(width: 140)
                             .tint(.cyan)
                     }
-                    .padding(9)
-                    .background(Color.black.opacity(0.70))
+                    .padding(8)
+                    .background(Color.black.opacity(0.72))
                     .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.white.opacity(0.2), lineWidth: 1))
                     .cornerRadius(14)
 
                     Spacer()
 
-                    VStack(alignment: .trailing, spacing: 6) {
-                        HStack(spacing: 6) {
+                    VStack(alignment: .trailing, spacing: 5) {
+                        // Часы Вселенной: дата, реверс, пауза и масштаб времени
+                        HStack(spacing: 5) {
+                            Text(sim.simDateText)
+                                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                                .foregroundColor(.white.opacity(0.85))
+                                .padding(.horizontal, 4)
+
+                            Button(action: { sim.isTimeReversed.toggle() }) {
+                                Image(systemName: sim.isTimeReversed ? "backward.fill" : "forward.fill")
+                                    .font(.system(size: 10))
+                                    .frame(width: 24, height: 24)
+                                    .background(sim.isTimeReversed ? Color.orange.opacity(0.65) : Color.white.opacity(0.14))
+                                    .clipShape(Circle())
+                            }
+
+                            Button(action: { sim.isTimePaused.toggle() }) {
+                                Image(systemName: sim.isTimePaused ? "play.fill" : "pause.fill")
+                                    .font(.system(size: 10))
+                                    .frame(width: 24, height: 24)
+                                    .background(sim.isTimePaused ? Color.red.opacity(0.65) : Color.white.opacity(0.14))
+                                    .clipShape(Circle())
+                            }
+
                             Button("−") { sim.timeWarpIndex = max(0, sim.timeWarpIndex - 1) }
-                                .frame(width: 26, height: 26)
+                                .frame(width: 24, height: 24)
                                 .background(Color.white.opacity(0.14))
                                 .clipShape(Circle())
-                            Text("⏱ \(sim.timeWarpSteps[sim.timeWarpIndex].label)")
-                                .font(.system(size: 11, weight: .bold, design: .monospaced))
+
+                            Text(sim.isTimePaused ? "ПАУЗА" : "\(sim.isTimeReversed ? "−" : "")\(sim.timeWarpSteps[sim.timeWarpIndex].label)")
+                                .font(.system(size: 10, weight: .bold, design: .monospaced))
                                 .foregroundColor(.yellow)
+                                .frame(minWidth: 46)
+
                             Button("+") { sim.timeWarpIndex = min(sim.timeWarpSteps.count - 1, sim.timeWarpIndex + 1) }
-                                .frame(width: 26, height: 26)
+                                .frame(width: 24, height: 24)
                                 .background(Color.white.opacity(0.14))
                                 .clipShape(Circle())
                         }
                         .foregroundColor(.white)
-                        .padding(6)
-                        .background(Color.black.opacity(0.70))
+                        .padding(.horizontal, 7).padding(.vertical, 5)
+                        .background(Color.black.opacity(0.72))
                         .overlay(Capsule().stroke(Color.white.opacity(0.2), lineWidth: 1))
                         .clipShape(Capsule())
 
                         HStack(spacing: 7) {
                             Button("−") { sim.speedIndex = max(0, sim.speedIndex - 1) }
-                                .frame(width: 30, height: 30)
+                                .frame(width: 28, height: 28)
                                 .background(Color.white.opacity(0.14))
                                 .clipShape(Circle())
 
                             Text(sim.speedSteps[sim.speedIndex].label)
-                                .font(.system(size: 12, weight: .bold, design: .monospaced))
-                                .frame(minWidth: 92)
+                                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                .frame(minWidth: 88)
 
                             Button("+") { sim.speedIndex = min(sim.speedSteps.count - 1, sim.speedIndex + 1) }
-                                .frame(width: 30, height: 30)
+                                .frame(width: 28, height: 28)
                                 .background(Color.white.opacity(0.14))
                                 .clipShape(Circle())
 
@@ -1413,20 +1601,96 @@ struct ContentView: View {
                                 sim.throttle = 0
                                 sim.shipVelocityMetersPerSec = .zero
                             }
-                            .font(.system(size: 11, weight: .bold))
-                            .padding(.horizontal, 10).padding(.vertical, 7)
+                            .font(.system(size: 10, weight: .bold))
+                            .padding(.horizontal, 10).padding(.vertical, 6)
                             .background(Color.red.opacity(0.82))
                             .clipShape(Capsule())
                         }
                         .foregroundColor(.white)
-                        .padding(7)
-                        .background(Color.black.opacity(0.70))
+                        .padding(6)
+                        .background(Color.black.opacity(0.72))
                         .overlay(Capsule().stroke(Color.white.opacity(0.2), lineWidth: 1))
                         .clipShape(Capsule())
                     }
                 }
-                .padding(.horizontal, 14)
-                .padding(.bottom, 12)
+                .padding(.horizontal, 12)
+                .padding(.bottom, 10)
+            }
+
+            // Научная инфо-карточка объекта (SpaceEngine Wiki / Telemetry)
+            if showInfo {
+                let b = sim.targetBody
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(b.name).font(.headline)
+                            Text(b.type).font(.caption).foregroundColor(.cyan)
+                        }
+                        Spacer()
+                        Button("Закрыть") { showInfo = false }
+                            .font(.caption.bold())
+                    }
+                    Divider().background(Color.white.opacity(0.2))
+                    Text(b.summary).font(.caption2).foregroundColor(.white.opacity(0.85))
+
+                    Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 4) {
+                        GridRow {
+                            Text("Радиус:").foregroundColor(.gray)
+                            Text(String(format: "%.0f км", b.radiusMeters / 1_000)).bold()
+                        }
+                        GridRow {
+                            Text("Гравитация:").foregroundColor(.gray)
+                            Text(String(format: "%.2f g", b.surfaceGravityG)).bold()
+                        }
+                        GridRow {
+                            Text("1-я / 2-я косм.:").foregroundColor(.gray)
+                            Text(String(format: "%.1f / %.1f км/с", b.firstCosmicVelocityMps / 1_000, b.escapeVelocityMps / 1_000)).bold()
+                        }
+                        GridRow {
+                            Text("Температура:").foregroundColor(.gray)
+                            Text(b.meanTempK > 0 ? "\(b.meanTempC) °C (\(b.meanTempK) K)" : "Горизонт событий").bold()
+                        }
+                        GridRow {
+                            Text("Наклон оси:").foregroundColor(.gray)
+                            Text(String(format: "%.1f°", b.axialTiltRad * 180.0 / .pi)).bold()
+                        }
+                        if b.orbitalPeriodSeconds > 0 {
+                            GridRow {
+                                Text("Год на орбите:").foregroundColor(.gray)
+                                Text(String(format: "%.1f земн. дн.", b.orbitalPeriodSeconds / 86_400)).bold()
+                            }
+                        }
+                    }
+                    .font(.system(size: 11, design: .monospaced))
+
+                    HStack(spacing: 8) {
+                        Button("Навести курс") {
+                            sim.alignToTarget()
+                            showInfo = false
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 7)
+                        .background(Color.white.opacity(0.15))
+                        .cornerRadius(8)
+
+                        Button("Перелёт на орбиту") {
+                            sim.warpToBody(b)
+                            showInfo = false
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 7)
+                        .background(Color.blue)
+                        .cornerRadius(8)
+                    }
+                    .font(.caption.bold())
+                    .padding(.top, 4)
+                }
+                .foregroundColor(.white)
+                .padding(14)
+                .frame(maxWidth: 340)
+                .background(Color.black.opacity(0.92))
+                .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.cyan.opacity(0.5), lineWidth: 1))
+                .cornerRadius(16)
             }
 
             if showCatalog {
