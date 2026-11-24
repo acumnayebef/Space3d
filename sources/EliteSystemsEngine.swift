@@ -1,6 +1,7 @@
 import Foundation
 import SceneKit
 import SwiftUI
+import UIKit
 import simd
 
 enum StationEconomy: String {
@@ -456,223 +457,222 @@ enum StationTab: String, CaseIterable, Identifiable {
 
 struct StationServicesOverlay: View {
     @ObservedObject var sim: SpaceSimulationController
+    let station: SpaceStation
     @State private var activeTab: StationTab = .market
 
     var body: some View {
-        if let station = sim.dockedStation {
-            let profile = sim.pilotProfile
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 10) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(station.name.uppercased())
-                            .font(.system(size: 14, weight: .black, design: .monospaced))
-                            .foregroundColor(.orange)
-                        Text("Экономика: \(station.economy.rawValue)")
-                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                            .foregroundColor(.white.opacity(0.75))
-                    }
-
-                    Spacer()
-
-                    VStack(alignment: .trailing, spacing: 2) {
-                        Text("\(profile.credits) CR")
-                            .font(.system(size: 13, weight: .bold, design: .monospaced))
-                            .foregroundColor(.yellow)
-                        Text("Трюм: \(profile.usedCargoTons) / \(profile.cargoCapacityTons) т")
-                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                            .foregroundColor(.cyan)
-                    }
-
-                    Button("ОТСТЫКОВКА") {
-                        sim.undockFromStation()
-                    }
-                    .font(.system(size: 10, weight: .bold, design: .monospaced))
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 12).padding(.vertical, 7)
-                    .background(Color.red.opacity(0.82))
-                    .clipShape(Capsule())
+        let profile = sim.pilotProfile
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(station.name.uppercased())
+                        .font(.system(size: 14, weight: .black, design: .monospaced))
+                        .foregroundColor(.orange)
+                    Text("Экономика: \(station.economy.rawValue)")
+                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.75))
                 }
 
-                HStack(spacing: 8) {
-                    ForEach(StationTab.allCases) { tab in
-                        Button(action: { activeTab = tab }) {
-                            HStack(spacing: 4) {
-                                Text(tab.rawValue)
-                                if tab == .cartography && profile.unsoldScanCount > 0 {
-                                    Text("(\(profile.unsoldScanCount))")
-                                        .foregroundColor(.yellow)
-                                }
+                Spacer()
+
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text("\(profile.credits) CR")
+                        .font(.system(size: 13, weight: .bold, design: .monospaced))
+                        .foregroundColor(.yellow)
+                    Text("Трюм: \(profile.usedCargoTons) / \(profile.cargoCapacityTons) т")
+                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                        .foregroundColor(.cyan)
+                }
+
+                Button("ОТСТЫКОВКА") {
+                    sim.undockFromStation()
+                }
+                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                .foregroundColor(.white)
+                .padding(.horizontal, 12).padding(.vertical, 7)
+                .background(Color.red.opacity(0.82))
+                .clipShape(Capsule())
+            }
+
+            HStack(spacing: 8) {
+                ForEach(StationTab.allCases) { tab in
+                    Button(action: { activeTab = tab }) {
+                        HStack(spacing: 4) {
+                            Text(tab.rawValue)
+                            if tab == .cartography && profile.unsoldScanCount > 0 {
+                                Text("(\(profile.unsoldScanCount))")
+                                    .foregroundColor(.yellow)
                             }
-                            .font(.system(size: 11, weight: .bold, design: .monospaced))
-                            .foregroundColor(activeTab == tab ? .black : .white)
-                            .padding(.horizontal, 12).padding(.vertical, 6)
-                            .background(activeTab == tab ? Color.orange : Color.white.opacity(0.12))
-                            .cornerRadius(6)
+                        }
+                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                        .foregroundColor(activeTab == tab ? .black : .white)
+                        .padding(.horizontal, 12).padding(.vertical, 6)
+                        .background(activeTab == tab ? Color.orange : Color.white.opacity(0.12))
+                        .cornerRadius(6)
+                    }
+                }
+                Spacer()
+            }
+
+            Divider().background(Color.orange.opacity(0.35))
+
+            ScrollView {
+                switch activeTab {
+                case .market:
+                    VStack(spacing: 6) {
+                        ForEach(EliteSystemsEngine.commodities) { item in
+                            let unitPrice = item.price(at: station.economy)
+                            let tag = item.demandTag(at: station.economy)
+                            let held = profile.cargo[item.id] ?? 0
+                            HStack(spacing: 8) {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(item.name)
+                                        .font(.system(size: 12, weight: .bold, design: .monospaced))
+                                    HStack(spacing: 6) {
+                                        Text("\(unitPrice) CR/т")
+                                            .foregroundColor(.yellow)
+                                        Text(tag)
+                                            .foregroundColor(tag.contains("СПРОС") ? .green : (tag.contains("ЭКСПОРТ") ? .cyan : .gray))
+                                        Text("• В трюме: \(held) т")
+                                            .foregroundColor(.white.opacity(0.75))
+                                    }
+                                    .font(.system(size: 10, design: .monospaced))
+                                }
+                                Spacer()
+
+                                Button("Продать всё") {
+                                    sim.sellCommodity(item, qty: held)
+                                }
+                                .disabled(held <= 0)
+                                .font(.system(size: 10, weight: .bold))
+                                .padding(.horizontal, 8).padding(.vertical, 5)
+                                .background(held > 0 ? Color.orange.opacity(0.75) : Color.white.opacity(0.08))
+                                .cornerRadius(6)
+
+                                Button("−1") {
+                                    sim.sellCommodity(item, qty: 1)
+                                }
+                                .disabled(held <= 0)
+                                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                .padding(.horizontal, 8).padding(.vertical, 5)
+                                .background(held > 0 ? Color.red.opacity(0.65) : Color.white.opacity(0.08))
+                                .cornerRadius(6)
+
+                                let freeSpace = profile.cargoCapacityTons - profile.usedCargoTons
+                                Button("+1") {
+                                    sim.buyCommodity(item, qty: 1)
+                                }
+                                .disabled(freeSpace < 1 || profile.credits < unitPrice)
+                                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                .padding(.horizontal, 8).padding(.vertical, 5)
+                                .background((freeSpace >= 1 && profile.credits >= unitPrice) ? Color.cyan.opacity(0.55) : Color.white.opacity(0.08))
+                                .cornerRadius(6)
+
+                                Button("+5") {
+                                    sim.buyCommodity(item, qty: 5)
+                                }
+                                .disabled(freeSpace < 5 || profile.credits < unitPrice * 5)
+                                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                .padding(.horizontal, 8).padding(.vertical, 5)
+                                .background((freeSpace >= 5 && profile.credits >= unitPrice * 5) ? Color.green.opacity(0.65) : Color.white.opacity(0.08))
+                                .cornerRadius(6)
+                            }
+                            .padding(8)
+                            .background(Color.white.opacity(0.07))
+                            .cornerRadius(8)
                         }
                     }
-                    Spacer()
-                }
 
-                Divider().background(Color.orange.opacity(0.35))
+                case .cartography:
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("Universal Cartographics • Множитель FSS: ×\(String(format: "%.1f", profile.fssPayoutMultiplier))")
+                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                                .foregroundColor(.cyan)
+                            Spacer()
+                            if profile.unsoldScanTotal > 0 {
+                                Button("ПРОДАТЬ ВСЕ ДАННЫЕ (+\(profile.unsoldScanTotal) CR)") {
+                                    sim.sellAllCartographics()
+                                }
+                                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                .foregroundColor(.black)
+                                .padding(.horizontal, 12).padding(.vertical, 6)
+                                .background(Color.green)
+                                .cornerRadius(6)
+                            }
+                        }
 
-                ScrollView {
-                    switch activeTab {
-                    case .market:
-                        VStack(spacing: 6) {
-                            ForEach(EliteSystemsEngine.commodities) { item in
-                                let unitPrice = item.price(at: station.economy)
-                                let tag = item.demandTag(at: station.economy)
-                                let held = profile.cargo[item.id] ?? 0
-                                HStack(spacing: 8) {
+                        if profile.scans.isEmpty {
+                            Text("Пока нет разведданных. Используйте FSS-сканер в космосе или СКАНЕР при прогулке на планете.")
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundColor(.white.opacity(0.65))
+                                .padding(.top, 16)
+                        } else {
+                            ForEach(Array(profile.scans.reversed())) { rec in
+                                HStack {
                                     VStack(alignment: .leading, spacing: 2) {
-                                        Text(item.name)
+                                        Text(rec.bodyName)
                                             .font(.system(size: 12, weight: .bold, design: .monospaced))
-                                        HStack(spacing: 6) {
-                                            Text("\(unitPrice) CR/т")
-                                                .foregroundColor(.yellow)
-                                            Text(tag)
-                                                .foregroundColor(tag.contains("СПРОС") ? .green : (tag.contains("ЭКСПОРТ") ? .cyan : .gray))
-                                            Text("• В трюме: \(held) т")
-                                                .foregroundColor(.white.opacity(0.75))
-                                        }
-                                        .font(.system(size: 10, design: .monospaced))
+                                        Text(rec.scanType)
+                                            .font(.system(size: 10, design: .monospaced))
+                                            .foregroundColor(.gray)
                                     }
                                     Spacer()
-
-                                    Button("Продать всё") {
-                                        sim.sellCommodity(item, qty: held)
+                                    if rec.sold {
+                                        Text("ПРОДАНО")
+                                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                            .foregroundColor(.gray)
+                                    } else {
+                                        Text("+\(rec.payoutCredits) CR")
+                                            .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                            .foregroundColor(.yellow)
                                     }
-                                    .disabled(held <= 0)
-                                    .font(.system(size: 10, weight: .bold))
-                                    .padding(.horizontal, 8).padding(.vertical, 5)
-                                    .background(held > 0 ? Color.orange.opacity(0.75) : Color.white.opacity(0.08))
-                                    .cornerRadius(6)
-
-                                    Button("−1") {
-                                        sim.sellCommodity(item, qty: 1)
-                                    }
-                                    .disabled(held <= 0)
-                                    .font(.system(size: 11, weight: .bold, design: .monospaced))
-                                    .padding(.horizontal, 8).padding(.vertical, 5)
-                                    .background(held > 0 ? Color.red.opacity(0.65) : Color.white.opacity(0.08))
-                                    .cornerRadius(6)
-
-                                    let freeSpace = profile.cargoCapacityTons - profile.usedCargoTons
-                                    Button("+1") {
-                                        sim.buyCommodity(item, qty: 1)
-                                    }
-                                    .disabled(freeSpace < 1 || profile.credits < unitPrice)
-                                    .font(.system(size: 11, weight: .bold, design: .monospaced))
-                                    .padding(.horizontal, 8).padding(.vertical, 5)
-                                    .background((freeSpace >= 1 && profile.credits >= unitPrice) ? Color.cyan.opacity(0.55) : Color.white.opacity(0.08))
-                                    .cornerRadius(6)
-
-                                    Button("+5") {
-                                        sim.buyCommodity(item, qty: 5)
-                                    }
-                                    .disabled(freeSpace < 5 || profile.credits < unitPrice * 5)
-                                    .font(.system(size: 11, weight: .bold, design: .monospaced))
-                                    .padding(.horizontal, 8).padding(.vertical, 5)
-                                    .background((freeSpace >= 5 && profile.credits >= unitPrice * 5) ? Color.green.opacity(0.65) : Color.white.opacity(0.08))
-                                    .cornerRadius(6)
                                 }
                                 .padding(8)
                                 .background(Color.white.opacity(0.07))
                                 .cornerRadius(8)
                             }
                         }
+                    }
 
-                    case .cartography:
-                        VStack(alignment: .leading, spacing: 8) {
-                            HStack {
-                                Text("Universal Cartographics • Множитель FSS: ×\(String(format: "%.1f", profile.fssPayoutMultiplier))")
-                                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                                    .foregroundColor(.cyan)
-                                Spacer()
-                                if profile.unsoldScanTotal > 0 {
-                                    Button("ПРОДАТЬ ВСЕ ДАННЫЕ (+\(profile.unsoldScanTotal) CR)") {
-                                        sim.sellAllCartographics()
-                                    }
-                                    .font(.system(size: 11, weight: .bold, design: .monospaced))
-                                    .foregroundColor(.black)
-                                    .padding(.horizontal, 12).padding(.vertical, 6)
-                                    .background(Color.green)
-                                    .cornerRadius(6)
-                                }
-                            }
-
-                            if profile.scans.isEmpty {
-                                Text("Пока нет разведданных. Используйте FSS-сканер в космосе или СКАНЕР при прогулке на планете.")
-                                    .font(.system(size: 11, design: .monospaced))
-                                    .foregroundColor(.white.opacity(0.65))
-                                    .padding(.top, 16)
-                            } else {
-                                ForEach(profile.scans.reversed()) { rec in
-                                    HStack {
-                                        VStack(alignment: .leading, spacing: 2) {
-                                            Text(rec.bodyName)
-                                                .font(.system(size: 12, weight: .bold, design: .monospaced))
-                                            Text(rec.scanType)
-                                                .font(.system(size: 10, design: .monospaced))
-                                                .foregroundColor(.gray)
-                                        }
-                                        Spacer()
-                                        if rec.sold {
-                                            Text("ПРОДАНО")
-                                                .font(.system(size: 10, weight: .bold, design: .monospaced))
-                                                .foregroundColor(.gray)
-                                        } else {
-                                            Text("+\(rec.payoutCredits) CR")
-                                                .font(.system(size: 11, weight: .bold, design: .monospaced))
-                                                .foregroundColor(.yellow)
-                                        }
-                                    }
-                                    .padding(8)
-                                    .background(Color.white.opacity(0.07))
-                                    .cornerRadius(8)
-                                }
-                            }
+                case .shipyard:
+                    VStack(spacing: 8) {
+                        upgradeRow(
+                            title: "Грузовой отсек (Ур. \(profile.cargoLevel + 1)/4)",
+                            desc: "Текущая вместимость: \(profile.cargoCapacityTons) т",
+                            cost: profile.nextCargoUpgradeCost,
+                            credits: profile.credits
+                        ) {
+                            sim.upgradeCargo()
                         }
 
-                    case .shipyard:
-                        VStack(spacing: 8) {
-                            upgradeRow(
-                                title: "Грузовой отсек (Ур. \(profile.cargoLevel + 1)/4)",
-                                desc: "Текущая вместимость: \(profile.cargoCapacityTons) т",
-                                cost: profile.nextCargoUpgradeCost,
-                                credits: profile.credits
-                            ) {
-                                sim.upgradeCargo()
-                            }
+                        upgradeRow(
+                            title: "Усилитель FSS-сканера (Ур. \(profile.fssLevel + 1)/4)",
+                            desc: "Множитель выплат за открытия: ×\(String(format: "%.1f", profile.fssPayoutMultiplier))",
+                            cost: profile.nextFSSUpgradeCost,
+                            credits: profile.credits
+                        ) {
+                            sim.upgradeFSS()
+                        }
 
-                            upgradeRow(
-                                title: "Усилитель FSS-сканера (Ур. \(profile.fssLevel + 1)/4)",
-                                desc: "Множитель выплат за открытия: ×\(String(format: "%.1f", profile.fssPayoutMultiplier))",
-                                cost: profile.nextFSSUpgradeCost,
-                                credits: profile.credits
-                            ) {
-                                sim.upgradeFSS()
-                            }
-
-                            upgradeRow(
-                                title: "Реактивный ранец EVA (Ур. \(profile.jetpackLevel + 1)/3)",
-                                desc: String(format: "Расход топлива: %.2f/с (заряд дольше на поверхностях)", profile.jetpackDrainPerSec),
-                                cost: profile.nextJetpackUpgradeCost,
-                                credits: profile.credits
-                            ) {
-                                sim.upgradeJetpack()
-                            }
+                        upgradeRow(
+                            title: "Реактивный ранец EVA (Ур. \(profile.jetpackLevel + 1)/3)",
+                            desc: String(format: "Расход топлива: %.2f/с (заряд дольше на поверхностях)", profile.jetpackDrainPerSec),
+                            cost: profile.nextJetpackUpgradeCost,
+                            credits: profile.credits
+                        ) {
+                            sim.upgradeJetpack()
                         }
                     }
                 }
             }
-            .foregroundColor(.white)
-            .padding(14)
-            .frame(maxWidth: 660, maxHeight: 335)
-            .background(Color.black.opacity(0.92))
-            .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.orange.opacity(0.65), lineWidth: 1.5))
-            .cornerRadius(14)
         }
+        .foregroundColor(.white)
+        .padding(14)
+        .frame(maxWidth: 660, maxHeight: 335)
+        .background(Color.black.opacity(0.92))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.orange.opacity(0.65), lineWidth: 1.5))
+        .cornerRadius(14)
     }
 
     @ViewBuilder
@@ -756,13 +756,7 @@ struct FSSScannerOverlay: View {
             HStack(alignment: .bottom, spacing: 3) {
                 ForEach(0..<36, id: \.self) { idx in
                     let barFreq = 10.0 + (Double(idx) / 35.0) * 90.0
-                    let targetPeak = exp(-pow((barFreq - targetFreq) / 4.2, 2.0)) * 38.0
-                    let cursorBoost = exp(-pow((barFreq - sim.fssFrequencyMHz) / 3.0, 2.0)) * 12.0
-                    let otherPeak = UniverseCatalog.bodies.prefix(16).reduce(0.0) { acc, b in
-                        let f = EliteSystemsEngine.fssFrequencyMHz(for: b)
-                        return max(acc, exp(-pow((barFreq - f) / 2.2, 2.0)) * 18.0)
-                    }
-                    let barH = CGFloat(min(44.0, 6.0 + max(targetPeak, otherPeak) + cursorBoost * 0.35))
+                    let barH = spectrumBarHeight(for: idx, targetFreq: targetFreq)
                     let nearCursor = abs(barFreq - sim.fssFrequencyMHz) < 2.8
                     RoundedRectangle(cornerRadius: 2)
                         .fill(nearCursor ? (isLocked ? Color.green : Color.orange) : Color.cyan.opacity(0.55))
@@ -821,5 +815,20 @@ struct FSSScannerOverlay: View {
         .background(Color.black.opacity(0.90))
         .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.cyan.opacity(0.55), lineWidth: 1.2))
         .cornerRadius(14)
+    }
+
+    private func spectrumBarHeight(for idx: Int, targetFreq: Double) -> CGFloat {
+        let barFreq = 10.0 + (Double(idx) / 35.0) * 90.0
+        let dTarget = (barFreq - targetFreq) / 4.2
+        let targetPeak = exp(-(dTarget * dTarget)) * 38.0
+        let dCursor = (barFreq - sim.fssFrequencyMHz) / 3.0
+        let cursorBoost = exp(-(dCursor * dCursor)) * 12.0
+        var otherPeak = 0.0
+        for b in UniverseCatalog.bodies.prefix(16) {
+            let f = EliteSystemsEngine.fssFrequencyMHz(for: b)
+            let d = (barFreq - f) / 2.2
+            otherPeak = max(otherPeak, exp(-(d * d)) * 18.0)
+        }
+        return CGFloat(min(44.0, 6.0 + max(targetPeak, otherPeak) + cursorBoost * 0.35))
     }
 }

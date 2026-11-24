@@ -3474,116 +3474,120 @@ struct ContentView: View {
                     .padding(.bottom, 10)
                 } else {
                     HStack(spacing: 6) {
-                        Button(action: {
-                            showCatalog = false
-                            showInfo = false
-                            sim.isMainMenu = true
-                        }) {
-                            Image(systemName: "line.3.horizontal")
-                                .font(.system(size: 13, weight: .bold))
-                                .padding(7)
-                                .background(Color.black.opacity(0.72))
-                                .overlay(Circle().stroke(Color.white.opacity(0.25), lineWidth: 1))
-                                .clipShape(Circle())
-                        }
-
-                        Button(action: { showCatalog.toggle(); showInfo = false }) {
-                            HStack(spacing: 5) {
-                                Image(systemName: "globe.americas.fill")
-                                Text("\(sim.targetBody.name) • \(sim.distanceText)")
-                                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                        HStack(spacing: 6) {
+                            Button(action: {
+                                showCatalog = false
+                                showInfo = false
+                                sim.isMainMenu = true
+                            }) {
+                                Image(systemName: "line.3.horizontal")
+                                    .font(.system(size: 13, weight: .bold))
+                                    .padding(7)
+                                    .background(Color.black.opacity(0.72))
+                                    .overlay(Circle().stroke(Color.white.opacity(0.25), lineWidth: 1))
+                                    .clipShape(Circle())
                             }
-                            .padding(.horizontal, 10).padding(.vertical, 6)
-                            .background(Color.black.opacity(0.72))
-                            .overlay(Capsule().stroke(Color.cyan.opacity(0.45), lineWidth: 1))
-                            .clipShape(Capsule())
+
+                            Button(action: { showCatalog.toggle(); showInfo = false }) {
+                                HStack(spacing: 5) {
+                                    Image(systemName: "globe.americas.fill")
+                                    Text("\(sim.targetBody.name) • \(sim.distanceText)")
+                                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                                }
+                                .padding(.horizontal, 10).padding(.vertical, 6)
+                                .background(Color.black.opacity(0.72))
+                                .overlay(Capsule().stroke(Color.cyan.opacity(0.45), lineWidth: 1))
+                                .clipShape(Capsule())
+                            }
+
+                            Button(action: { showInfo.toggle(); showCatalog = false }) {
+                                Image(systemName: "info.circle.fill")
+                                    .font(.system(size: 14))
+                                    .padding(6)
+                                    .background(showInfo ? Color.cyan.opacity(0.45) : Color.black.opacity(0.72))
+                                    .clipShape(Circle())
+                            }
+
+                            Text("\(sim.speedText) • \(sim.etaText)")
+                                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                                .foregroundColor(.cyan)
+                                .padding(.horizontal, 8).padding(.vertical, 6)
+                                .background(Color.black.opacity(0.72))
+                                .clipShape(Capsule())
+
+                            Text("\(sim.pilotProfile.credits) CR")
+                                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                .foregroundColor(.yellow)
+                                .padding(.horizontal, 8).padding(.vertical, 6)
+                                .background(Color.black.opacity(0.72))
+                                .overlay(Capsule().stroke(Color.yellow.opacity(0.35), lineWidth: 1))
+                                .clipShape(Capsule())
                         }
-
-                        Button(action: { showInfo.toggle(); showCatalog = false }) {
-                            Image(systemName: "info.circle.fill")
-                                .font(.system(size: 14))
-                                .padding(6)
-                                .background(showInfo ? Color.cyan.opacity(0.45) : Color.black.opacity(0.72))
-                                .clipShape(Circle())
-                        }
-
-                        Text("\(sim.speedText) • \(sim.etaText)")
-                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                            .foregroundColor(.cyan)
-                            .padding(.horizontal, 8).padding(.vertical, 6)
-                            .background(Color.black.opacity(0.72))
-                            .clipShape(Capsule())
-
-                        Text("\(sim.pilotProfile.credits) CR")
-                            .font(.system(size: 10, weight: .bold, design: .monospaced))
-                            .foregroundColor(.yellow)
-                            .padding(.horizontal, 8).padding(.vertical, 6)
-                            .background(Color.black.opacity(0.72))
-                            .overlay(Capsule().stroke(Color.yellow.opacity(0.35), lineWidth: 1))
-                            .clipShape(Capsule())
 
                         Spacer()
 
-                        Button(action: {
-                            showCatalog = false
-                            showInfo = false
-                            sim.isFSSOpen.toggle()
-                        }) {
-                            HStack(spacing: 3) {
-                                Image(systemName: "waveform.path.ecg")
-                                Text("FSS")
+                        HStack(spacing: 6) {
+                            Button(action: {
+                                showCatalog = false
+                                showInfo = false
+                                sim.isFSSOpen.toggle()
+                            }) {
+                                HStack(spacing: 3) {
+                                    Image(systemName: "waveform.path.ecg")
+                                    Text("FSS")
+                                }
+                                .font(.system(size: 10, weight: .bold))
+                                .padding(.horizontal, 8).padding(.vertical, 6)
+                                .background(sim.isFSSOpen ? Color.cyan.opacity(0.45) : Color.black.opacity(0.72))
+                                .overlay(Capsule().stroke(Color.cyan.opacity(0.35), lineWidth: 1))
+                                .clipShape(Capsule())
                             }
-                            .font(.system(size: 10, weight: .bold))
-                            .padding(.horizontal, 8).padding(.vertical, 6)
-                            .background(sim.isFSSOpen ? Color.cyan.opacity(0.45) : Color.black.opacity(0.72))
-                            .overlay(Capsule().stroke(Color.cyan.opacity(0.35), lineWidth: 1))
-                            .clipShape(Capsule())
-                        }
 
-                        Button(action: { sim.showOrbits.toggle() }) {
-                            Text("Орбиты")
-                                .font(.system(size: 10, weight: .bold))
-                                .padding(.horizontal, 8).padding(.vertical, 6)
-                                .background(sim.showOrbits ? Color.cyan.opacity(0.35) : Color.black.opacity(0.72))
-                                .overlay(Capsule().stroke(Color.white.opacity(0.22), lineWidth: 1))
-                                .clipShape(Capsule())
-                        }
+                            Button(action: { sim.showOrbits.toggle() }) {
+                                Text("Орбиты")
+                                    .font(.system(size: 10, weight: .bold))
+                                    .padding(.horizontal, 8).padding(.vertical, 6)
+                                    .background(sim.showOrbits ? Color.cyan.opacity(0.35) : Color.black.opacity(0.72))
+                                    .overlay(Capsule().stroke(Color.white.opacity(0.22), lineWidth: 1))
+                                    .clipShape(Capsule())
+                            }
 
-                        Button(action: { sim.showMarkers.toggle() }) {
-                            Text("Метки")
-                                .font(.system(size: 10, weight: .bold))
-                                .padding(.horizontal, 8).padding(.vertical, 6)
-                                .background(sim.showMarkers ? Color.cyan.opacity(0.35) : Color.black.opacity(0.72))
-                                .overlay(Capsule().stroke(Color.white.opacity(0.22), lineWidth: 1))
-                                .clipShape(Capsule())
-                        }
+                            Button(action: { sim.showMarkers.toggle() }) {
+                                Text("Метки")
+                                    .font(.system(size: 10, weight: .bold))
+                                    .padding(.horizontal, 8).padding(.vertical, 6)
+                                    .background(sim.showMarkers ? Color.cyan.opacity(0.35) : Color.black.opacity(0.72))
+                                    .overlay(Capsule().stroke(Color.white.opacity(0.22), lineWidth: 1))
+                                    .clipShape(Capsule())
+                            }
 
-                        Button("На цель") { sim.alignToTarget() }
-                            .font(.system(size: 10, weight: .bold))
-                            .padding(.horizontal, 9).padding(.vertical, 6)
-                            .background(Color.blue.opacity(0.82))
-                            .clipShape(Capsule())
-
-                        // Переключатель SpaceEngine: Свободная камера / Корабль
-                        Button(action: { sim.toggleFreeCamera() }) {
-                            Text(sim.isFreeCamera ? "Корабль" : "Камера")
+                            Button("На цель") { sim.alignToTarget() }
                                 .font(.system(size: 10, weight: .bold))
                                 .padding(.horizontal, 9).padding(.vertical, 6)
-                                .background(sim.isFreeCamera ? Color.orange.opacity(0.82) : Color.black.opacity(0.72))
+                                .background(Color.blue.opacity(0.82))
+                                .clipShape(Capsule())
+
+                            // Переключатель SpaceEngine: Свободная камера / Корабль
+                            Button(action: { sim.toggleFreeCamera() }) {
+                                Text(sim.isFreeCamera ? "Корабль" : "Камера")
+                                    .font(.system(size: 10, weight: .bold))
+                                    .padding(.horizontal, 9).padding(.vertical, 6)
+                                    .background(sim.isFreeCamera ? Color.orange.opacity(0.82) : Color.black.opacity(0.72))
+                                    .overlay(Capsule().stroke(Color.white.opacity(0.25), lineWidth: 1))
+                                    .clipShape(Capsule())
+                            }
+
+                            if !sim.isFreeCamera {
+                                Button(sim.isThirdPerson ? "1-е лицо" : "3-е лицо") {
+                                    sim.isThirdPerson.toggle()
+                                    sim.updateCameraMode()
+                                }
+                                .font(.system(size: 10, weight: .bold))
+                                .padding(.horizontal, 9).padding(.vertical, 6)
+                                .background(Color.black.opacity(0.72))
                                 .overlay(Capsule().stroke(Color.white.opacity(0.25), lineWidth: 1))
                                 .clipShape(Capsule())
-                        }
-
-                        if !sim.isFreeCamera {
-                            Button(sim.isThirdPerson ? "1-е лицо" : "3-е лицо") {
-                                sim.isThirdPerson.toggle()
-                                sim.updateCameraMode()
                             }
-                            .font(.system(size: 10, weight: .bold))
-                            .padding(.horizontal, 9).padding(.vertical, 6)
-                            .background(Color.black.opacity(0.72))
-                            .overlay(Capsule().stroke(Color.white.opacity(0.25), lineWidth: 1))
-                            .clipShape(Capsule())
                         }
                     }
                     .foregroundColor(.white)
@@ -3920,10 +3924,10 @@ struct ContentView: View {
             }
 
             if showCatalog && !sim.isWalkingOnSurface && !sim.isMainMenu && sim.dockedStation == nil {
-                let filteredBodies = (selectedCategory == .stations)
+                let filteredBodies: [CelestialBody] = (selectedCategory == .stations)
                     ? []
                     : UniverseCatalog.bodies.filter { selectedCategory == .all || $0.category == selectedCategory }
-                let filteredStations = (selectedCategory == .all || selectedCategory == .stations)
+                let filteredStations: [SpaceStation] = (selectedCategory == .all || selectedCategory == .stations)
                     ? EliteSystemsEngine.stations
                     : []
                 let totalCount = filteredBodies.count + filteredStations.count
@@ -4035,8 +4039,8 @@ struct ContentView: View {
                 .cornerRadius(16)
             }
 
-            if sim.dockedStation != nil && !sim.isMainMenu {
-                StationServicesOverlay(sim: sim)
+            if let station = sim.dockedStation, !sim.isMainMenu {
+                StationServicesOverlay(sim: sim, station: station)
             }
 
             if sim.isFSSOpen && !sim.isMainMenu && !sim.isWalkingOnSurface && sim.dockedStation == nil {
