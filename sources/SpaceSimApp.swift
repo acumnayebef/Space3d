@@ -99,6 +99,8 @@ final class SpaceSimulationController: ObservableObject {
     @Published var evaJetpackFuel: Double = 1.0
     @Published var evaShipDistanceText: String = "7 м"
     @Published var evaTempText: String = "15 °C"
+    @Published var evaScannerOpen: Bool = false
+    @Published var evaScanReport: SurfaceScanReport? = nil
 
     let speedSteps: [(label: String, mps: Double)] = [
         ("1.5 км/с", 1_500),
@@ -151,6 +153,7 @@ final class SpaceSimulationController: ObservableObject {
     private var evaRefForwardLocal: SIMD3<Double> = SIMD3<Double>(0, 0, -1)
     private var jetpackFuelState: Double = 1.0
     private var hasPropsForCurrentAnchor: Bool = false
+    private var activeTerrainCollision: SurfaceTerrainEngine.TerrainCollisionGrid? = nil
     private var parkedShipBodyId: String?
     private var parkedShipLocalPos: SIMD3<Double> = .zero
     private var parkedShipLocalOrient: simd_quatd = simd_quatd(angle: 0, axis: SIMD3<Double>(0, 1, 0))
@@ -1551,8 +1554,11 @@ final class SpaceSimulationController: ObservableObject {
         isLanded = false
         lastTerrainAltitude = -1
         activeSurfaceBodyId = nil
+        activeTerrainCollision = nil
         lastTrackedBodyId = nil
         hasPropsForCurrentAnchor = false
+        evaScannerOpen = false
+        evaScanReport = nil
         terrainRootNode.isHidden = true
         skyDomeNode.isHidden = true
         surfacePropsNode.isHidden = true
@@ -1600,8 +1606,11 @@ final class SpaceSimulationController: ObservableObject {
         angularVelPitch = 0
         lastTerrainAltitude = -1
         activeSurfaceBodyId = nil
+        activeTerrainCollision = nil
         lastTrackedBodyId = nil
         hasPropsForCurrentAnchor = false
+        evaScannerOpen = false
+        evaScanReport = nil
         reentryHeat = 0.0
 
         let bodyPos = body.currentPosition(simulationTime: simulationTimeSeconds, allBodies: UniverseCatalog.bodies)
@@ -1627,6 +1636,62 @@ final class SpaceSimulationController: ObservableObject {
         updateCameraMode()
     }
 
+    private func groundSampleAt(
+        worldPos: SIMD3<Double>,
+        body: CelestialBody,
+        bodyPos: SIMD3<Double>,
+        planetRot: simd_quatd,
+        invPlanetRot: simd_quatd
+    ) -> (height: Double, isWater: Bool) {
+        let up = safeNormalize(worldPos - bodyPos, fallback: SIMD3<Double>(0, 1, 0))
+        let sample = SurfaceTerrainEngine.sampleTerrain(localDir: invPlanetRot.act(up), body: body)
+        if activeSurfaceBodyId == body.id,
+           let meshHeight = activeTerrainCollision?.sampleHeight(
+               worldPos: worldPos,
+               currentPlanetRot: planetRot,
+               currentBodyPos: bodyPos
+           ) {
+            return (meshHeight, sample.isWater)
+        }
+        let h = body.isHabitableWorld ? max(0.0, sample.heightMeters) : sample.heightMeters
+        return (h, sample.isWater)
+    }
+
+    func toggleSurfaceScanner() {
+        evaScannerOpen.toggle()
+        guard evaScannerOpen else {
+            evaScanReport = nil
+            return
+        }
+        var nearestBody = targetBody
+        var nearestDist = Double.greatestFiniteMagnitude
+        var nearestPos = SIMD3<Double>.zero
+        for body in UniverseCatalog.bodies where body.isLandable {
+            let pos = body.currentPosition(simulationTime: simulationTimeSeconds, allBodies: UniverseCatalog.bodies)
+            let d = simd_length(shipPositionMeters - pos) - body.radiusMeters
+            if d < nearestDist {
+                nearestDist = d
+                nearestBody = body
+                nearestPos = pos
+            }
+        }
+        let (_, _, invRot) = planetSpinAndInvRot(for: nearestBody)
+        let curRot = planetRot(for: nearestBody)
+        let upWorld = safeNormalize(shipPositionMeters - nearestPos, fallback: SIMD3<Double>(0, 1, 0))
+        let ground = groundSampleAt(
+            worldPos: shipPositionMeters,
+            body: nearestBody,
+            bodyPos: nearestPos,
+            planetRot: curRot,
+            invPlanetRot: invRot
+        )
+        evaScanReport = SurfaceTerrainEngine.surfaceScanReport(
+            body: nearestBody,
+            localDir: invRot.act(upWorld),
+            elevationMeters: ground.height
+        )
+    }
+
     func landAtCurrentSpot() {
         guard !walkingState, !isFreeCamera else { return }
         var nearestBody = targetBody
@@ -1644,15 +1709,22 @@ final class SpaceSimulationController: ObservableObject {
         guard nearestBody.isLandable else { return }
         let upWorld = safeNormalize(shipPositionMeters - nearestPos, fallback: SIMD3<Double>(0, 1, 0))
         let (_, _, invRot) = planetSpinAndInvRot(for: nearestBody)
-        let sample = SurfaceTerrainEngine.sampleTerrain(localDir: invRot.act(upWorld), body: nearestBody)
-        let effectiveGround = nearestBody.isHabitableWorld ? max(0.0, sample.heightMeters) : sample.heightMeters
-        let radarAlt = max(0.0, nearestDist - effectiveGround)
-        guard !sample.isWater && radarAlt < 1_800.0 else { return }
+        let curRot = planetRot(for: nearestBody)
+        let ground = groundSampleAt(
+            worldPos: shipPositionMeters,
+            body: nearestBody,
+            bodyPos: nearestPos,
+            planetRot: curRot,
+            invPlanetRot: invRot
+        )
+        let radarAlt = max(0.0, nearestDist - ground.height)
+        guard !ground.isWater && radarAlt < 1_800.0 else { return }
 
-        shipPositionMeters = nearestPos + upWorld * (nearestBody.radiusMeters + effectiveGround + 1.35)
+        shipPositionMeters = nearestPos + upWorld * (nearestBody.radiusMeters + ground.height + 1.35)
         levelToHorizon()
         throttle = 0
         shipVelocityMetersPerSec = .zero
+        hasPropsForCurrentAnchor = false
         landedState = true
         isLanded = true
         landingGearNode.isHidden = false
@@ -1697,9 +1769,14 @@ final class SpaceSimulationController: ObservableObject {
 
         let playerSpot = shipPositionMeters + tangentRight * 7.0
         let playerUp = safeNormalize(playerSpot - nearestPos, fallback: upWorld)
-        let sample = SurfaceTerrainEngine.sampleTerrain(localDir: invRot.act(playerUp), body: nearestBody)
-        let gH = nearestBody.isHabitableWorld ? max(0.0, sample.heightMeters) : sample.heightMeters
-        shipPositionMeters = nearestPos + playerUp * (nearestBody.radiusMeters + gH + 1.85)
+        let ground = groundSampleAt(
+            worldPos: playerSpot,
+            body: nearestBody,
+            bodyPos: nearestPos,
+            planetRot: curRot,
+            invPlanetRot: invRot
+        )
+        shipPositionMeters = nearestPos + playerUp * (nearestBody.radiusMeters + ground.height + 1.85)
 
         let lookAtShip = safeNormalize(shipFwd * 0.35 - tangentRight * 0.90)
         evaRefForwardLocal = invRot.act(lookAtShip)
@@ -1724,6 +1801,8 @@ final class SpaceSimulationController: ObservableObject {
         isFreeCamera = false
         evaSprinting = false
         evaJetpackActive = false
+        evaScannerOpen = false
+        evaScanReport = nil
         jetpackFuelState = 1.0
         evaJetpackFuel = 1.0
         evaShipDistanceText = "7 м"
@@ -1755,6 +1834,8 @@ final class SpaceSimulationController: ObservableObject {
         isWalkingOnSurface = false
         evaSprinting = false
         evaJetpackActive = false
+        evaScannerOpen = false
+        evaScanReport = nil
         jetpackFuelState = 1.0
         evaJetpackFuel = 1.0
         hasPropsForCurrentAnchor = false
@@ -1893,12 +1974,18 @@ final class SpaceSimulationController: ObservableObject {
         }
 
         var lastSampleIsWater = false
+        let curNearestRot = planetRot(for: nearestBody)
         var upWorld = safeNormalize(shipPositionMeters - nearestBodyPos, fallback: SIMD3<Double>(0, 1, 0))
         if nearestBody.isLandable && nearestSurfaceDist < 350_000 {
-            let localDir = invNearestRot.act(upWorld)
-            let sample = SurfaceTerrainEngine.sampleTerrain(localDir: localDir, body: nearestBody)
-            lastSampleIsWater = sample.isWater
-            currentGroundHeightMeters = nearestBody.isHabitableWorld ? max(0.0, sample.heightMeters) : sample.heightMeters
+            let ground = groundSampleAt(
+                worldPos: shipPositionMeters,
+                body: nearestBody,
+                bodyPos: nearestBodyPos,
+                planetRot: curNearestRot,
+                invPlanetRot: invNearestRot
+            )
+            lastSampleIsWater = ground.isWater
+            currentGroundHeightMeters = ground.height
         } else {
             currentGroundHeightMeters = 0.0
         }
@@ -1953,9 +2040,15 @@ final class SpaceSimulationController: ObservableObject {
             }
 
             upWorld = safeNormalize(shipPositionMeters - nearestBodyPos, fallback: SIMD3<Double>(0, 1, 0))
-            let sample = SurfaceTerrainEngine.sampleTerrain(localDir: invNearestRot.act(upWorld), body: nearestBody)
-            lastSampleIsWater = sample.isWater
-            let effectiveGround = nearestBody.isHabitableWorld ? max(0.0, sample.heightMeters) : sample.heightMeters
+            let ground = groundSampleAt(
+                worldPos: shipPositionMeters,
+                body: nearestBody,
+                bodyPos: nearestBodyPos,
+                planetRot: curPlanetRot,
+                invPlanetRot: invNearestRot
+            )
+            lastSampleIsWater = ground.isWater
+            let effectiveGround = ground.height
             currentGroundHeightMeters = effectiveGround
 
             let horizSpeed = simd_length(horizVel)
@@ -2096,10 +2189,15 @@ final class SpaceSimulationController: ObservableObject {
 
         if !walkingState && nearestBody.isLandable && nearestSurfaceDist < 350_000 {
             upWorld = safeNormalize(shipPositionMeters - nearestBodyPos, fallback: SIMD3<Double>(0, 1, 0))
-            let localDir = invNearestRot.act(upWorld)
-            let sample = SurfaceTerrainEngine.sampleTerrain(localDir: localDir, body: nearestBody)
-            lastSampleIsWater = sample.isWater
-            let effectiveGround = nearestBody.isHabitableWorld ? max(0.0, sample.heightMeters) : sample.heightMeters
+            let ground = groundSampleAt(
+                worldPos: shipPositionMeters,
+                body: nearestBody,
+                bodyPos: nearestBodyPos,
+                planetRot: curNearestRot,
+                invPlanetRot: invNearestRot
+            )
+            lastSampleIsWater = ground.isWater
+            let effectiveGround = ground.height
             currentGroundHeightMeters = effectiveGround
 
             let hoverClearance = isFreeCamera ? 2.0 : 1.35
@@ -2112,7 +2210,7 @@ final class SpaceSimulationController: ObservableObject {
                 if vRadial < 0 {
                     shipVelocityMetersPerSec -= upWorld * vRadial
                 }
-                if !isFreeCamera && throttle < 0.15 && !sample.isWater {
+                if !isFreeCamera && throttle < 0.15 && !ground.isWater {
                     landedState = true
                     shipVelocityMetersPerSec = .zero
                 }
@@ -2196,7 +2294,7 @@ final class SpaceSimulationController: ObservableObject {
                 ? simd_length(shipPositionMeters - currentAnchorWorld)
                 : Double.greatestFiniteMagnitude
             let wantProps = updatedSurfaceDist < 2_500.0
-            let moveLimit = wantProps ? 220.0 : max(1_200.0, updatedSurfaceDist * 0.25)
+            let moveLimit = walkingState ? 70.0 : (wantProps ? 220.0 : max(1_200.0, updatedSurfaceDist * 0.25))
             let needsRebuild = (activeSurfaceBodyId != nearestBody.id)
                 || (lastTerrainAltitude < 0)
                 || (abs(updatedSurfaceDist - lastTerrainAltitude) > max(400.0, lastTerrainAltitude * 0.25))
@@ -2208,6 +2306,7 @@ final class SpaceSimulationController: ObservableObject {
                     body: nearestBody,
                     bodyPos: nearestBodyPos,
                     anchorWorld: shipPositionMeters,
+                    planetRot: curPlanetRot,
                     invPlanetRot: invNearestRot,
                     altitudeMeters: max(50.0, updatedSurfaceDist),
                     whitePixel: whitePixel,
@@ -2216,6 +2315,7 @@ final class SpaceSimulationController: ObservableObject {
                 terrainMeshNode.geometry = res.terrain
                 oceanMeshNode.geometry = res.ocean
                 oceanMeshNode.isHidden = (res.ocean == nil)
+                activeTerrainCollision = res.collision
                 activeSurfaceBodyId = nearestBody.id
                 lastTerrainAnchorLocal = invNearestRot.act(shipPositionMeters - nearestBodyPos)
                 lastTerrainBuildPlanetRot = curPlanetRot
@@ -2239,7 +2339,8 @@ final class SpaceSimulationController: ObservableObject {
                         anchorWorld: shipPositionMeters,
                         planetRot: curPlanetRot,
                         invPlanetRot: invNearestRot,
-                        clearCenterWorld: clearPos
+                        clearCenterWorld: clearPos,
+                        collisionGrid: res.collision
                     )
                     for child in builtProps.childNodes {
                         surfacePropsNode.addChildNode(child)
@@ -2276,6 +2377,7 @@ final class SpaceSimulationController: ObservableObject {
             terrainRootNode.isHidden = true
             surfacePropsNode.isHidden = true
             hasPropsForCurrentAnchor = false
+            activeTerrainCollision = nil
             activeSurfaceBodyId = nil
             lastTerrainAltitude = -1
         }
@@ -2317,11 +2419,11 @@ final class SpaceSimulationController: ObservableObject {
             scene.fogStartDistance = CGFloat(max(12_000.0, 26_000.0 / fogDensity))
             scene.fogEndDistance = CGFloat(max(85_000.0, 260_000.0 / fogDensity))
 
-            ambientLightNode.light?.intensity = 22.0 + CGFloat(atmoDensity * dayFactor * 65.0)
+            ambientLightNode.light?.intensity = 38.0 + CGFloat(atmoDensity * dayFactor * 95.0)
         } else {
             skyDomeNode.isHidden = true
             scene.fogEndDistance = 0
-            ambientLightNode.light?.intensity = 22.0
+            ambientLightNode.light?.intensity = (nearestBody.isLandable && updatedSurfaceDist < 240_000) ? 42.0 : 22.0
         }
 
         var prioritizedMarkers: [BodyScreenMarker] = []
@@ -2673,7 +2775,7 @@ struct ContentView: View {
                 .allowsHitTesting(false)
             }
 
-            if sim.showMarkers {
+            if sim.showMarkers && !sim.isWalkingOnSurface {
                 ForEach(sim.screenMarkers) { marker in
                     Button(action: {
                         if let found = UniverseCatalog.bodies.first(where: { $0.id == marker.id }) {
@@ -2704,175 +2806,308 @@ struct ContentView: View {
             }
 
             VStack {
-                HStack(spacing: 6) {
-                    Button(action: { showCatalog.toggle(); showInfo = false }) {
-                        HStack(spacing: 5) {
-                            Image(systemName: "globe.americas.fill")
-                            Text("\(sim.targetBody.name) • \(sim.distanceText)")
-                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                if sim.isWalkingOnSurface {
+                    HStack(spacing: 8) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "airplane")
+                                .foregroundColor(.cyan)
+                            Text("КОРАБЛЬ • \(sim.evaShipDistanceText)")
+                                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                .foregroundColor(.white)
+                            Text("ПОСАЖЕН")
+                                .font(.system(size: 9, weight: .bold, design: .monospaced))
+                                .foregroundColor(.green)
+                                .padding(.horizontal, 6).padding(.vertical, 2)
+                                .background(Color.green.opacity(0.20))
+                                .clipShape(Capsule())
                         }
-                        .padding(.horizontal, 10).padding(.vertical, 6)
-                        .background(Color.black.opacity(0.72))
+                        .padding(.horizontal, 11).padding(.vertical, 6)
+                        .background(Color.black.opacity(0.76))
                         .overlay(Capsule().stroke(Color.cyan.opacity(0.45), lineWidth: 1))
                         .clipShape(Capsule())
-                    }
 
-                    Button(action: { showInfo.toggle(); showCatalog = false }) {
-                        Image(systemName: "info.circle.fill")
-                            .font(.system(size: 14))
-                            .padding(6)
-                            .background(showInfo ? Color.cyan.opacity(0.45) : Color.black.opacity(0.72))
-                            .clipShape(Circle())
-                    }
+                        Spacer()
 
-                    Text("\(sim.speedText) • \(sim.etaText)")
-                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                        .foregroundColor(.cyan)
-                        .padding(.horizontal, 8).padding(.vertical, 6)
-                        .background(Color.black.opacity(0.72))
-                        .clipShape(Capsule())
+                        Button(action: { sim.toggleSurfaceScanner() }) {
+                            HStack(spacing: 5) {
+                                Image(systemName: "dot.radiowaves.left.and.right")
+                                Text("СКАНЕР")
+                            }
+                            .font(.system(size: 11, weight: .bold, design: .monospaced))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 12).padding(.vertical, 7)
+                            .background(sim.evaScannerOpen ? Color.cyan.opacity(0.60) : Color.black.opacity(0.76))
+                            .overlay(Capsule().stroke(Color.cyan.opacity(0.5), lineWidth: 1))
+                            .clipShape(Capsule())
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.top, 10)
+
+                    if sim.evaScannerOpen, let report = sim.evaScanReport {
+                        VStack(alignment: .leading, spacing: 5) {
+                            HStack {
+                                Text("СКАНЕР ПОВЕРХНОСТИ • \(report.planetName)")
+                                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                    .foregroundColor(.cyan)
+                                Spacer()
+                                Button(action: { sim.toggleSurfaceScanner() }) {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .font(.system(size: 13))
+                                        .foregroundColor(.white.opacity(0.7))
+                                }
+                            }
+                            Text("Биом: \(report.biomeName)")
+                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                                .foregroundColor(.white)
+                            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 3) {
+                                GridRow {
+                                    Text("Высота:").foregroundColor(.gray)
+                                    Text("\(report.elevationMeters) м").bold()
+                                }
+                                GridRow {
+                                    Text("Гравитация:").foregroundColor(.gray)
+                                    Text(String(format: "%.2f g (%.1f м/с²)", report.gravityG, report.gravityMps2)).bold()
+                                }
+                                GridRow {
+                                    Text("Темп. / Атм.:").foregroundColor(.gray)
+                                    Text("\(report.tempC) °C • \(report.atmosphereText)").bold()
+                                }
+                                GridRow {
+                                    Text("Состав:").foregroundColor(.gray)
+                                    Text(report.compositionText).bold()
+                                }
+                            }
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundColor(.white)
+                        }
+                        .padding(10)
+                        .frame(maxWidth: 380)
+                        .background(Color.black.opacity(0.84))
+                        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.cyan.opacity(0.45), lineWidth: 1))
+                        .cornerRadius(12)
+                        .padding(.top, 4)
+                    }
 
                     Spacer()
 
-                    Button(action: { sim.showOrbits.toggle() }) {
-                        Text("Орбиты")
-                            .font(.system(size: 10, weight: .bold))
-                            .padding(.horizontal, 8).padding(.vertical, 6)
-                            .background(sim.showOrbits ? Color.cyan.opacity(0.35) : Color.black.opacity(0.72))
-                            .overlay(Capsule().stroke(Color.white.opacity(0.22), lineWidth: 1))
-                            .clipShape(Capsule())
-                    }
-
-                    Button(action: { sim.showMarkers.toggle() }) {
-                        Text("Метки")
-                            .font(.system(size: 10, weight: .bold))
-                            .padding(.horizontal, 8).padding(.vertical, 6)
-                            .background(sim.showMarkers ? Color.cyan.opacity(0.35) : Color.black.opacity(0.72))
-                            .overlay(Capsule().stroke(Color.white.opacity(0.22), lineWidth: 1))
-                            .clipShape(Capsule())
-                    }
-
-                    Button("На цель") { sim.alignToTarget() }
-                        .font(.system(size: 10, weight: .bold))
-                        .padding(.horizontal, 9).padding(.vertical, 6)
-                        .background(Color.blue.opacity(0.82))
-                        .clipShape(Capsule())
-
-                    // Переключатель SpaceEngine: Свободная камера / Корабль
-                    Button(action: { sim.toggleFreeCamera() }) {
-                        Text(sim.isFreeCamera ? "Корабль" : "Камера")
-                            .font(.system(size: 10, weight: .bold))
-                            .padding(.horizontal, 9).padding(.vertical, 6)
-                            .background(sim.isFreeCamera ? Color.orange.opacity(0.82) : Color.black.opacity(0.72))
-                            .overlay(Capsule().stroke(Color.white.opacity(0.25), lineWidth: 1))
-                            .clipShape(Capsule())
-                    }
-
-                    if !sim.isFreeCamera && !sim.isWalkingOnSurface {
-                        Button(sim.isThirdPerson ? "1-е лицо" : "3-е лицо") {
-                            sim.isThirdPerson.toggle()
-                            sim.updateCameraMode()
+                    HStack(alignment: .bottom, spacing: 10) {
+                        VirtualFlightStick(label: sim.evaSprinting ? "СПРИНТ" : "ХОДЬБА") { pt in
+                            sim.stickInput = pt
                         }
-                        .font(.system(size: 10, weight: .bold))
-                        .padding(.horizontal, 9).padding(.vertical, 6)
-                        .background(Color.black.opacity(0.72))
-                        .overlay(Capsule().stroke(Color.white.opacity(0.25), lineWidth: 1))
-                        .clipShape(Capsule())
-                    }
-                }
-                .foregroundColor(.white)
-                .padding(.horizontal, 12)
-                .padding(.top, 10)
 
-                if sim.isNearSurface {
-                    HStack(spacing: 8) {
-                        Text(sim.atmosphereZoneText)
-                            .font(.system(size: 10, weight: .bold, design: .monospaced))
-                            .foregroundColor(sim.isWalkingOnSurface ? .cyan : (sim.isLanded ? .green : .orange))
+                        Spacer()
 
-                        Text(sim.surfaceAltitudeText)
-                            .font(.system(size: 10, weight: .bold, design: .monospaced))
-                            .foregroundColor(.white)
-
-                        if sim.isWalkingOnSurface {
-                            Text(sim.evaTempText)
-                                .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                                .foregroundColor(.yellow.opacity(0.9))
-
-                            Text("КОРАБЛЬ: \(sim.evaShipDistanceText)")
-                                .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                                .foregroundColor(.green.opacity(0.95))
-
-                            HStack(spacing: 4) {
-                                Image(systemName: "flame.fill")
-                                    .font(.system(size: 9))
-                                    .foregroundColor(sim.evaJetpackActive ? .orange : .cyan)
-                                GeometryReader { geo in
-                                    ZStack(alignment: .leading) {
-                                        Capsule().fill(Color.white.opacity(0.2))
-                                        Capsule()
-                                            .fill(sim.evaJetpackFuel > 0.25 ? Color.cyan : Color.red)
-                                            .frame(width: max(2, geo.size.width * CGFloat(sim.evaJetpackFuel)))
-                                    }
-                                }
-                                .frame(width: 44, height: 6)
+                        HStack(spacing: 6) {
+                            Button(action: { sim.evaSprinting.toggle() }) {
+                                Text("СПРИНТ")
+                                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                    .lineLimit(1)
+                                    .fixedSize(horizontal: true, vertical: false)
+                                    .padding(.horizontal, 9).padding(.vertical, 7)
+                                    .background(sim.evaSprinting ? Color.cyan.opacity(0.55) : Color.white.opacity(0.16))
+                                    .clipShape(Capsule())
                             }
-                        } else if sim.isLanded {
-                            Button("ВЫЙТИ") {
-                                sim.enterWalkingMode()
+
+                            Button(action: {
+                                if sim.evaJetpackFuel > 0.02 || sim.evaJetpackActive {
+                                    sim.evaJetpackActive.toggle()
+                                }
+                            }) {
+                                HStack(spacing: 5) {
+                                    Text("РАНЕЦ \(Int(sim.evaJetpackFuel * 100))%")
+                                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                        .lineLimit(1)
+                                        .fixedSize(horizontal: true, vertical: false)
+                                    GeometryReader { geo in
+                                        ZStack(alignment: .leading) {
+                                            Capsule().fill(Color.white.opacity(0.22))
+                                            Capsule()
+                                                .fill(sim.evaJetpackFuel > 0.25 ? Color.cyan : Color.red)
+                                                .frame(width: max(2, geo.size.width * CGFloat(sim.evaJetpackFuel)))
+                                        }
+                                    }
+                                    .frame(width: 28, height: 5)
+                                }
+                                .padding(.horizontal, 9).padding(.vertical, 7)
+                                .background(sim.evaJetpackActive ? Color.orange.opacity(0.78) : Color.white.opacity(0.16))
+                                .clipShape(Capsule())
+                            }
+
+                            Button("ПРЫЖОК") {
+                                sim.evaJump()
                             }
                             .font(.system(size: 10, weight: .bold))
-                            .foregroundColor(.white)
-                            .padding(.horizontal, 9).padding(.vertical, 4)
-                            .background(Color.cyan.opacity(0.55))
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                            .padding(.horizontal, 10).padding(.vertical, 7)
+                            .background(Color.orange.opacity(0.85))
                             .clipShape(Capsule())
 
-                            Button("ВЗЛЁТ") {
-                                sim.takeoffFromSurface()
+                            Button("В КОРАБЛЬ") {
+                                sim.boardShip()
                             }
                             .font(.system(size: 10, weight: .bold))
-                            .foregroundColor(.white)
-                            .padding(.horizontal, 9).padding(.vertical, 4)
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                            .padding(.horizontal, 10).padding(.vertical, 7)
                             .background(Color.green.opacity(0.85))
                             .clipShape(Capsule())
-                        } else {
-                            if sim.canAutoLand {
-                                Button("ПОСАДИТЬ") {
-                                    sim.landAtCurrentSpot()
+                        }
+                        .foregroundColor(.white)
+                        .padding(6)
+                        .background(Color.black.opacity(0.76))
+                        .overlay(Capsule().stroke(Color.cyan.opacity(0.35), lineWidth: 1))
+                        .clipShape(Capsule())
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 10)
+                } else {
+                    HStack(spacing: 6) {
+                        Button(action: { showCatalog.toggle(); showInfo = false }) {
+                            HStack(spacing: 5) {
+                                Image(systemName: "globe.americas.fill")
+                                Text("\(sim.targetBody.name) • \(sim.distanceText)")
+                                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                            }
+                            .padding(.horizontal, 10).padding(.vertical, 6)
+                            .background(Color.black.opacity(0.72))
+                            .overlay(Capsule().stroke(Color.cyan.opacity(0.45), lineWidth: 1))
+                            .clipShape(Capsule())
+                        }
+
+                        Button(action: { showInfo.toggle(); showCatalog = false }) {
+                            Image(systemName: "info.circle.fill")
+                                .font(.system(size: 14))
+                                .padding(6)
+                                .background(showInfo ? Color.cyan.opacity(0.45) : Color.black.opacity(0.72))
+                                .clipShape(Circle())
+                        }
+
+                        Text("\(sim.speedText) • \(sim.etaText)")
+                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                            .foregroundColor(.cyan)
+                            .padding(.horizontal, 8).padding(.vertical, 6)
+                            .background(Color.black.opacity(0.72))
+                            .clipShape(Capsule())
+
+                        Spacer()
+
+                        Button(action: { sim.showOrbits.toggle() }) {
+                            Text("Орбиты")
+                                .font(.system(size: 10, weight: .bold))
+                                .padding(.horizontal, 8).padding(.vertical, 6)
+                                .background(sim.showOrbits ? Color.cyan.opacity(0.35) : Color.black.opacity(0.72))
+                                .overlay(Capsule().stroke(Color.white.opacity(0.22), lineWidth: 1))
+                                .clipShape(Capsule())
+                        }
+
+                        Button(action: { sim.showMarkers.toggle() }) {
+                            Text("Метки")
+                                .font(.system(size: 10, weight: .bold))
+                                .padding(.horizontal, 8).padding(.vertical, 6)
+                                .background(sim.showMarkers ? Color.cyan.opacity(0.35) : Color.black.opacity(0.72))
+                                .overlay(Capsule().stroke(Color.white.opacity(0.22), lineWidth: 1))
+                                .clipShape(Capsule())
+                        }
+
+                        Button("На цель") { sim.alignToTarget() }
+                            .font(.system(size: 10, weight: .bold))
+                            .padding(.horizontal, 9).padding(.vertical, 6)
+                            .background(Color.blue.opacity(0.82))
+                            .clipShape(Capsule())
+
+                        // Переключатель SpaceEngine: Свободная камера / Корабль
+                        Button(action: { sim.toggleFreeCamera() }) {
+                            Text(sim.isFreeCamera ? "Корабль" : "Камера")
+                                .font(.system(size: 10, weight: .bold))
+                                .padding(.horizontal, 9).padding(.vertical, 6)
+                                .background(sim.isFreeCamera ? Color.orange.opacity(0.82) : Color.black.opacity(0.72))
+                                .overlay(Capsule().stroke(Color.white.opacity(0.25), lineWidth: 1))
+                                .clipShape(Capsule())
+                        }
+
+                        if !sim.isFreeCamera {
+                            Button(sim.isThirdPerson ? "1-е лицо" : "3-е лицо") {
+                                sim.isThirdPerson.toggle()
+                                sim.updateCameraMode()
+                            }
+                            .font(.system(size: 10, weight: .bold))
+                            .padding(.horizontal, 9).padding(.vertical, 6)
+                            .background(Color.black.opacity(0.72))
+                            .overlay(Capsule().stroke(Color.white.opacity(0.25), lineWidth: 1))
+                            .clipShape(Capsule())
+                        }
+                    }
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.top, 10)
+
+                    if sim.isNearSurface {
+                        HStack(spacing: 8) {
+                            Text(sim.atmosphereZoneText)
+                                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                .foregroundColor(sim.isLanded ? .green : .orange)
+
+                            Text(sim.surfaceAltitudeText)
+                                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                .foregroundColor(.white)
+
+                            if sim.isLanded {
+                                Button("ВЫЙТИ") {
+                                    sim.enterWalkingMode()
+                                }
+                                .font(.system(size: 10, weight: .bold))
+                                .foregroundColor(.white)
+                                .padding(.horizontal, 9).padding(.vertical, 4)
+                                .background(Color.cyan.opacity(0.55))
+                                .clipShape(Capsule())
+
+                                Button("ВЗЛЁТ") {
+                                    sim.takeoffFromSurface()
                                 }
                                 .font(.system(size: 10, weight: .bold))
                                 .foregroundColor(.white)
                                 .padding(.horizontal, 9).padding(.vertical, 4)
                                 .background(Color.green.opacity(0.85))
                                 .clipShape(Capsule())
-                            }
-                            if !sim.isFreeCamera {
-                                Button("ГОРИЗОНТ") {
-                                    sim.levelToHorizon()
+                            } else {
+                                if sim.canAutoLand {
+                                    Button("ПОСАДИТЬ") {
+                                        sim.landAtCurrentSpot()
+                                    }
+                                    .font(.system(size: 10, weight: .bold))
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 9).padding(.vertical, 4)
+                                    .background(Color.green.opacity(0.85))
+                                    .clipShape(Capsule())
                                 }
-                                .font(.system(size: 10, weight: .bold))
-                                .foregroundColor(.white)
-                                .padding(.horizontal, 9).padding(.vertical, 4)
-                                .background(Color.cyan.opacity(0.45))
-                                .clipShape(Capsule())
+                                if !sim.isFreeCamera {
+                                    Button("ГОРИЗОНТ") {
+                                        sim.levelToHorizon()
+                                    }
+                                    .font(.system(size: 10, weight: .bold))
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 9).padding(.vertical, 4)
+                                    .background(Color.cyan.opacity(0.45))
+                                    .clipShape(Capsule())
+                                }
                             }
                         }
-                    }
-                    .padding(.horizontal, 12).padding(.vertical, 5)
-                    .background(Color.black.opacity(0.72))
-                    .overlay(Capsule().stroke(Color.cyan.opacity(0.4), lineWidth: 1))
-                    .clipShape(Capsule())
-                    .padding(.top, 2)
-                }
-
-                Spacer()
-
-                HStack(alignment: .bottom, spacing: 10) {
-                    VirtualFlightStick(label: sim.isWalkingOnSurface ? (sim.evaSprinting ? "СПРИНТ" : "ХОДЬБА") : (sim.isFreeCamera ? "WASD" : "РУЛЬ")) { pt in
-                        sim.stickInput = pt
+                        .padding(.horizontal, 12).padding(.vertical, 5)
+                        .background(Color.black.opacity(0.72))
+                        .overlay(Capsule().stroke(Color.cyan.opacity(0.4), lineWidth: 1))
+                        .clipShape(Capsule())
+                        .padding(.top, 2)
                     }
 
-                    if !sim.isWalkingOnSurface {
+                    Spacer()
+
+                    HStack(alignment: .bottom, spacing: 10) {
+                        VirtualFlightStick(label: sim.isFreeCamera ? "WASD" : "РУЛЬ") { pt in
+                            sim.stickInput = pt
+                        }
+
                         VStack(alignment: .leading, spacing: 5) {
                             HStack {
                                 Text(sim.isFreeCamera ? "КРУИЗ: \(Int(sim.throttle * 100))%" : "ТЯГА: \(Int(sim.throttle * 100))%")
@@ -2897,116 +3132,63 @@ struct ContentView: View {
                         .background(Color.black.opacity(0.72))
                         .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.white.opacity(0.2), lineWidth: 1))
                         .cornerRadius(14)
-                    }
 
-                    Spacer()
+                        Spacer()
 
-                    VStack(alignment: .trailing, spacing: 5) {
-                        HStack(spacing: 5) {
-                            Text(sim.simDateText)
-                                .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                                .foregroundColor(.white.opacity(0.85))
-                                .lineLimit(1)
-                                .fixedSize(horizontal: true, vertical: false)
-                                .padding(.horizontal, 4)
+                        VStack(alignment: .trailing, spacing: 5) {
+                            HStack(spacing: 5) {
+                                Text(sim.simDateText)
+                                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                                    .foregroundColor(.white.opacity(0.85))
+                                    .lineLimit(1)
+                                    .fixedSize(horizontal: true, vertical: false)
+                                    .padding(.horizontal, 4)
 
-                            Button(action: { sim.isTimeReversed.toggle() }) {
-                                Image(systemName: sim.isTimeReversed ? "backward.fill" : "forward.fill")
-                                    .font(.system(size: 10))
-                                    .frame(width: 24, height: 24)
-                                    .background(sim.isTimeReversed ? Color.orange.opacity(0.65) : Color.white.opacity(0.18))
-                                    .clipShape(Circle())
-                            }
-
-                            Button(action: { sim.isTimePaused.toggle() }) {
-                                Image(systemName: sim.isTimePaused ? "play.fill" : "pause.fill")
-                                    .font(.system(size: 10))
-                                    .frame(width: 24, height: 24)
-                                    .background(sim.isTimePaused ? Color.red.opacity(0.65) : Color.white.opacity(0.18))
-                                    .clipShape(Circle())
-                            }
-
-                            Button(action: { sim.timeWarpIndex = max(0, sim.timeWarpIndex - 1) }) {
-                                Text("−")
-                                    .font(.system(size: 14, weight: .bold))
-                                    .foregroundColor(.white)
-                                    .frame(width: 24, height: 24)
-                                    .background(Color.white.opacity(0.18))
-                                    .clipShape(Circle())
-                            }
-
-                            Text(sim.isTimePaused ? "ПАУЗА" : "\(sim.isTimeReversed ? "−" : "")\(sim.timeWarpSteps[sim.timeWarpIndex].label)")
-                                .font(.system(size: 10, weight: .bold, design: .monospaced))
-                                .foregroundColor(.yellow)
-                                .frame(minWidth: 46)
-
-                            Button(action: { sim.timeWarpIndex = min(sim.timeWarpSteps.count - 1, sim.timeWarpIndex + 1) }) {
-                                Text("+")
-                                    .font(.system(size: 14, weight: .bold))
-                                    .foregroundColor(.white)
-                                    .frame(width: 24, height: 24)
-                                    .background(Color.white.opacity(0.18))
-                                    .clipShape(Circle())
-                            }
-                        }
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 7).padding(.vertical, 5)
-                        .background(Color.black.opacity(0.72))
-                        .overlay(Capsule().stroke(Color.white.opacity(0.2), lineWidth: 1))
-                        .clipShape(Capsule())
-
-                        if sim.isWalkingOnSurface {
-                            HStack(spacing: 6) {
-                                Button(action: { sim.evaSprinting.toggle() }) {
-                                    Text("СПРИНТ")
-                                        .font(.system(size: 10, weight: .bold, design: .monospaced))
-                                        .lineLimit(1)
-                                        .fixedSize(horizontal: true, vertical: false)
-                                        .padding(.horizontal, 9).padding(.vertical, 7)
-                                        .background(sim.evaSprinting ? Color.cyan.opacity(0.55) : Color.white.opacity(0.16))
-                                        .clipShape(Capsule())
+                                Button(action: { sim.isTimeReversed.toggle() }) {
+                                    Image(systemName: sim.isTimeReversed ? "backward.fill" : "forward.fill")
+                                        .font(.system(size: 10))
+                                        .frame(width: 24, height: 24)
+                                        .background(sim.isTimeReversed ? Color.orange.opacity(0.65) : Color.white.opacity(0.18))
+                                        .clipShape(Circle())
                                 }
 
-                                Button(action: {
-                                    if sim.evaJetpackFuel > 0.02 || sim.evaJetpackActive {
-                                        sim.evaJetpackActive.toggle()
-                                    }
-                                }) {
-                                    Text("РАНЕЦ \(Int(sim.evaJetpackFuel * 100))%")
-                                        .font(.system(size: 10, weight: .bold, design: .monospaced))
-                                        .lineLimit(1)
-                                        .fixedSize(horizontal: true, vertical: false)
-                                        .padding(.horizontal, 9).padding(.vertical, 7)
-                                        .background(sim.evaJetpackActive ? Color.orange.opacity(0.78) : Color.white.opacity(0.16))
-                                        .clipShape(Capsule())
+                                Button(action: { sim.isTimePaused.toggle() }) {
+                                    Image(systemName: sim.isTimePaused ? "play.fill" : "pause.fill")
+                                        .font(.system(size: 10))
+                                        .frame(width: 24, height: 24)
+                                        .background(sim.isTimePaused ? Color.red.opacity(0.65) : Color.white.opacity(0.18))
+                                        .clipShape(Circle())
                                 }
 
-                                Button("ПРЫЖОК") {
-                                    sim.evaJump()
+                                Button(action: { sim.timeWarpIndex = max(0, sim.timeWarpIndex - 1) }) {
+                                    Text("−")
+                                        .font(.system(size: 14, weight: .bold))
+                                        .foregroundColor(.white)
+                                        .frame(width: 24, height: 24)
+                                        .background(Color.white.opacity(0.18))
+                                        .clipShape(Circle())
                                 }
-                                .font(.system(size: 10, weight: .bold))
-                                .lineLimit(1)
-                                .fixedSize(horizontal: true, vertical: false)
-                                .padding(.horizontal, 10).padding(.vertical, 7)
-                                .background(Color.orange.opacity(0.85))
-                                .clipShape(Capsule())
 
-                                Button("В КОРАБЛЬ") {
-                                    sim.boardShip()
+                                Text(sim.isTimePaused ? "ПАУЗА" : "\(sim.isTimeReversed ? "−" : "")\(sim.timeWarpSteps[sim.timeWarpIndex].label)")
+                                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                    .foregroundColor(.yellow)
+                                    .frame(minWidth: 46)
+
+                                Button(action: { sim.timeWarpIndex = min(sim.timeWarpSteps.count - 1, sim.timeWarpIndex + 1) }) {
+                                    Text("+")
+                                        .font(.system(size: 14, weight: .bold))
+                                        .foregroundColor(.white)
+                                        .frame(width: 24, height: 24)
+                                        .background(Color.white.opacity(0.18))
+                                        .clipShape(Circle())
                                 }
-                                .font(.system(size: 10, weight: .bold))
-                                .lineLimit(1)
-                                .fixedSize(horizontal: true, vertical: false)
-                                .padding(.horizontal, 10).padding(.vertical, 7)
-                                .background(Color.green.opacity(0.85))
-                                .clipShape(Capsule())
                             }
                             .foregroundColor(.white)
-                            .padding(6)
+                            .padding(.horizontal, 7).padding(.vertical, 5)
                             .background(Color.black.opacity(0.72))
-                            .overlay(Capsule().stroke(Color.cyan.opacity(0.35), lineWidth: 1))
+                            .overlay(Capsule().stroke(Color.white.opacity(0.2), lineWidth: 1))
                             .clipShape(Capsule())
-                        } else {
+
                             HStack(spacing: 6) {
                                 // Кнопка логарифмической авто-скорости SpaceEngine
                                 Button(action: { sim.autoSpeed.toggle() }) {
@@ -3064,12 +3246,12 @@ struct ContentView: View {
                             .clipShape(Capsule())
                         }
                     }
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 10)
                 }
-                .padding(.horizontal, 12)
-                .padding(.bottom, 10)
             }
 
-            if showInfo {
+            if showInfo && !sim.isWalkingOnSurface {
                 let b = sim.targetBody
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
@@ -3162,7 +3344,7 @@ struct ContentView: View {
                 .cornerRadius(16)
             }
 
-            if showCatalog {
+            if showCatalog && !sim.isWalkingOnSurface {
                 let filteredBodies = UniverseCatalog.bodies.filter {
                     selectedCategory == .all || $0.category == selectedCategory
                 }
