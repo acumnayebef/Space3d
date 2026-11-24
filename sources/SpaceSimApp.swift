@@ -22,7 +22,6 @@ final class SpaceSimulationController: ObservableObject {
     let sunLightNode = SCNNode()
     var exhaustNodes: [SCNNode] = []
 
-    // Старт на орбите Земли: виден терминатор, континенты, облака и Луна вдали
     var shipPositionMeters = SIMD3<Double>(-UniverseCatalog.au + 11_500_000, 3_500_000, 12_500_000)
     var shipOrientation = simd_quatd(angle: 0.65, axis: simd_normalize(SIMD3<Double>(-0.2, 1.0, 0.0)))
 
@@ -55,7 +54,6 @@ final class SpaceSimulationController: ObservableObject {
     private func setupScene() {
         scene.background.contents = UIColor.black
 
-        // Направленный солнечный свет без пересвета белым[span_13](start_span)[span_13](end_span)[span_14](start_span)[span_14](end_span)
         let sunLight = SCNLight()
         sunLight.type = .directional
         sunLight.intensity = 1350
@@ -63,7 +61,6 @@ final class SpaceSimulationController: ObservableObject {
         sunLightNode.light = sunLight
         scene.rootNode.addChildNode(sunLightNode)
 
-        // Лёгкая подсветка ночной стороны
         let ambient = SCNLight()
         ambient.type = .ambient
         ambient.intensity = 45
@@ -72,7 +69,6 @@ final class SpaceSimulationController: ObservableObject {
         ambientNode.light = ambient
         scene.rootNode.addChildNode(ambientNode)
 
-        // Корабль (3-е лицо) и кабина (1-е лицо)
         buildThirdPersonShip()
         buildFirstPersonCockpit()
         shipNode.addChildNode(thirdPersonMeshNode)
@@ -89,6 +85,15 @@ final class SpaceSimulationController: ObservableObject {
 
         buildStarfield()
         buildCelestialBodies()
+    }
+
+    private func deterministicSeed(_ str: String) -> UInt64 {
+        var hash: UInt64 = 14695981039346656037
+        for byte in str.utf8 {
+            hash ^= UInt64(byte)
+            hash = hash &* 1099511628211
+        }
+        return hash
     }
 
     private func buildCelestialBodies() {
@@ -113,13 +118,13 @@ final class SpaceSimulationController: ObservableObject {
             let planetMesh = SCNNode(geometry: sphere)
             root.addChildNode(planetMesh)
 
-            // Слой облаков для планет с атмосферой
             if body.hasAtmosphere && !body.isStar {
                 let cloudSphere = SCNSphere(radius: 1.012)
                 cloudSphere.segmentCount = 72
                 let cloudMat = SCNMaterial()
-                cloudMat.diffuse.contents = generateCloudTexture(seed: body.id.hashValue)
-                cloudMat.transparent.contents = cloudMat.diffuse.contents
+                let cloudTex = generateCloudTexture(seed: deterministicSeed(body.id))
+                cloudMat.diffuse.contents = cloudTex
+                cloudMat.transparent.contents = cloudTex
                 cloudMat.isDoubleSided = false
                 cloudMat.writesToDepthBuffer = false
                 cloudSphere.materials = [cloudMat]
@@ -127,7 +132,6 @@ final class SpaceSimulationController: ObservableObject {
                 root.addChildNode(cloudNode)
                 cloudNodes[body.id] = cloudNode
 
-                // Свечение атмосферы по краю диска (Fresnel)
                 let atmoSphere = SCNSphere(radius: 1.032)
                 atmoSphere.segmentCount = 64
                 let atmoMat = SCNMaterial()
@@ -142,7 +146,6 @@ final class SpaceSimulationController: ObservableObject {
                 root.addChildNode(SCNNode(geometry: atmoSphere))
             }
 
-            // Кольца Сатурна / аккреционный диск ЧД
             if body.hasRings {
                 let ring = SCNTube(innerRadius: 1.35, outerRadius: 2.35, height: 0.004)
                 let ringMat = SCNMaterial()
@@ -175,12 +178,10 @@ final class SpaceSimulationController: ObservableObject {
         accentMat.metalness.contents = 0.4
         accentMat.roughness.contents = 0.4
 
-        // Фюзеляж
         let hull = SCNBox(width: 2.4, height: 0.65, length: 6.8, chamferRadius: 0.22)
         hull.materials = [hullMat]
         thirdPersonMeshNode.addChildNode(SCNNode(geometry: hull))
 
-        // Носовой обтекатель
         let nose = SCNPyramid(width: 2.3, height: 2.6, length: 0.62)
         nose.materials = [hullMat]
         let noseNode = SCNNode(geometry: nose)
@@ -188,7 +189,6 @@ final class SpaceSimulationController: ObservableObject {
         noseNode.position = SCNVector3(0, 0, -3.4)
         thirdPersonMeshNode.addChildNode(noseNode)
 
-        // Дельта-крылья с оранжевыми законцовками
         let wings = SCNBox(width: 7.6, height: 0.14, length: 3.1, chamferRadius: 0.06)
         wings.materials = [hullMat]
         let wingsNode = SCNNode(geometry: wings)
@@ -201,7 +201,6 @@ final class SpaceSimulationController: ObservableObject {
         stripeNode.position = SCNVector3(0, -0.08, 2.1)
         thirdPersonMeshNode.addChildNode(stripeNode)
 
-        // Фонарь кабины
         let canopy = SCNSphere(radius: 0.6)
         let glassMat = SCNMaterial()
         glassMat.lightingModel = .physicallyBased
@@ -214,7 +213,6 @@ final class SpaceSimulationController: ObservableObject {
         canopyNode.position = SCNVector3(0, 0.36, -1.1)
         thirdPersonMeshNode.addChildNode(canopyNode)
 
-        // 2 маршевых двигателя с плазменными струями
         exhaustNodes.removeAll()
         for xOffset in [-0.85, 0.85] {
             let nozzle = SCNCylinder(radius: 0.28, height: 0.5)
@@ -247,7 +245,6 @@ final class SpaceSimulationController: ObservableObject {
         let neonMat = SCNMaterial()
         neonMat.emission.contents = UIColor(red: 0.0, green: 0.82, blue: 1.0, alpha: 1.0)
 
-        // Нижняя наклонная торпеда кабины (не перекрывает центр экрана!)[span_15](start_span)[span_15](end_span)
         let dash = SCNBox(width: 2.2, height: 0.35, length: 0.7, chamferRadius: 0.05)
         dash.materials = [frameMat]
         let dashNode = SCNNode(geometry: dash)
@@ -255,14 +252,12 @@ final class SpaceSimulationController: ObservableObject {
         dashNode.eulerAngles.x = 0.28
         cockpitMeshNode.addChildNode(dashNode)
 
-        // Неоновая окантовка приборной панели
         let trim = SCNBox(width: 1.85, height: 0.015, length: 0.02, chamferRadius: 0.005)
         trim.materials = [neonMat]
         let trimNode = SCNNode(geometry: trim)
         trimNode.position = SCNVector3(0, -0.39, -0.62)
         cockpitMeshNode.addChildNode(trimNode)
 
-        // Левая и правая стойки фонаря кабины
         for side in [-1.0, 1.0] {
             let strut = SCNBox(width: 0.045, height: 1.15, length: 0.045, chamferRadius: 0.01)
             strut.materials = [frameMat]
@@ -272,14 +267,12 @@ final class SpaceSimulationController: ObservableObject {
             cockpitMeshNode.addChildNode(sNode)
         }
 
-        // Верхняя перекладина фонаря
         let topBar = SCNBox(width: 1.35, height: 0.04, length: 0.04, chamferRadius: 0.01)
         topBar.materials = [frameMat]
         let topNode = SCNNode(geometry: topBar)
         topNode.position = SCNVector3(0, 0.56, -0.64)
         cockpitMeshNode.addChildNode(topNode)
 
-        // Коллиматорный прицел в центре лобового стекла
         let crosshair = SCNTorus(ringRadius: 0.045, pipeRadius: 0.0025)
         crosshair.materials = [neonMat]
         let chNode = SCNNode(geometry: crosshair)
@@ -314,120 +307,117 @@ final class SpaceSimulationController: ObservableObject {
 
     private func generateStarTexture() -> UIImage {
         let w = 2048, h = 1024
-        UIGraphicsBeginImageContextWithOptions(CGSize(width: w, height: h), true, 1.0)
-        guard let ctx = UIGraphicsGetCurrentContext() else { return UIImage() }
-        ctx.setFillColor(UIColor.black.cgColor)
-        ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: w, height: h))
+        return renderer.image { context in
+            let ctx = context.cgContext
+            ctx.setFillColor(UIColor.black.cgColor)
+            ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
 
-        // Полоса Млечного Пути
-        for i in 0..<2500 {
-            let x = CGFloat((i * 48271) % w)
-            let spread = sin(Double(x) / Double(w) * .pi * 2.0) * 140.0
-            let offset = Double((i * 16807) % 240) - 120.0
-            let y = CGFloat(Double(h) * 0.5 + spread + offset * 0.65)
-            ctx.setFillColor(UIColor(red: 0.65, green: 0.78, blue: 1.0, alpha: 0.08).cgColor)
-            ctx.fillEllipse(in: CGRect(x: x, y: y, width: 3.5, height: 3.5))
-        }
+            for i in 0..<2500 {
+                let x = CGFloat((i * 48271) % w)
+                let spread = sin(Double(x) / Double(w) * .pi * 2.0) * 140.0
+                let offset = Double((i * 16807) % 240) - 120.0
+                let y = CGFloat(Double(h) * 0.5 + spread + offset * 0.65)
+                ctx.setFillColor(UIColor(red: 0.65, green: 0.78, blue: 1.0, alpha: 0.08).cgColor)
+                ctx.fillEllipse(in: CGRect(x: x, y: y, width: 3.5, height: 3.5))
+            }
 
-        // Яркие звёзды разного спектрального цвета
-        let starColors: [UIColor] = [
-            .white,
-            UIColor(red: 0.75, green: 0.88, blue: 1.0, alpha: 1.0),
-            UIColor(red: 1.0, green: 0.92, blue: 0.75, alpha: 1.0),
-            UIColor(red: 1.0, green: 0.72, blue: 0.55, alpha: 1.0)
-        ]
-        for i in 0..<6000 {
-            let x = CGFloat((i * 73856093) % w)
-            let y = CGFloat((i * 19349663) % h)
-            let r = (i % 14 == 0) ? CGFloat(2.1) : CGFloat(1.1)
-            let alpha = CGFloat((i % 75) + 25) / 100.0
-            ctx.setFillColor(starColors[i % starColors.count].withAlphaComponent(alpha).cgColor)
-            ctx.fillEllipse(in: CGRect(x: x, y: y, width: r, height: r))
+            let starColors: [UIColor] = [
+                .white,
+                UIColor(red: 0.75, green: 0.88, blue: 1.0, alpha: 1.0),
+                UIColor(red: 1.0, green: 0.92, blue: 0.75, alpha: 1.0),
+                UIColor(red: 1.0, green: 0.72, blue: 0.55, alpha: 1.0)
+            ]
+            for i in 0..<6000 {
+                let x = CGFloat((i * 73856093) % w)
+                let y = CGFloat((i * 19349663) % h)
+                let r = (i % 14 == 0) ? CGFloat(2.1) : CGFloat(1.1)
+                let alpha = CGFloat((i % 75) + 25) / 100.0
+                ctx.setFillColor(starColors[i % starColors.count].withAlphaComponent(alpha).cgColor)
+                ctx.fillEllipse(in: CGRect(x: x, y: y, width: r, height: r))
+            }
         }
-        let img = UIGraphicsGetImageFromCurrentImageContext() ?? UIImage()
-        UIGraphicsEndImageContext()
-        return img
     }
 
     private func generatePlanetTexture(body: CelestialBody) -> UIImage {
         let w = 512, h = 256
-        UIGraphicsBeginImageContextWithOptions(CGSize(width: w, height: h), true, 1.0)
-        guard let ctx = UIGraphicsGetCurrentContext() else { return UIImage() }
-        let c1 = uiColor(from: body.colorHex)
-        let c2 = uiColor(from: body.secondaryHex)
-        ctx.setFillColor(c1.cgColor)
-        ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: w, height: h))
+        return renderer.image { context in
+            let ctx = context.cgContext
+            let c1 = uiColor(from: body.colorHex)
+            let c2 = uiColor(from: body.secondaryHex)
+            ctx.setFillColor(c1.cgColor)
+            ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
 
-        let seed = abs(body.id.hashValue)
-        if body.id == "jupiter" || body.id == "saturn" || body.id == "uranus" || body.id == "neptune" {
-            // Широтные облачные пояса газовых гигантов
-            for row in 0..<32 {
-                let y = CGFloat(row) * CGFloat(h) / 32.0
-                let bandH = CGFloat(h) / 32.0 + 1
-                let mix = ((row + seed) % 3 == 0) ? c2.withAlphaComponent(0.65) : c1.withAlphaComponent(0.75)
-                ctx.setFillColor(mix.cgColor)
-                ctx.fill(CGRect(x: 0, y: y, width: CGFloat(w), height: bandH))
-            }
-        } else {
-            // Процедурные материки / кратеры / грануляция
-            for i in 0..<180 {
-                let cx = CGFloat(((i * 97 + seed) % w))
-                let cy = CGFloat(((i * 53 + seed * 3) % (h - 36)) + 18)
-                let rw = CGFloat(((i * 29) % 58) + 14)
-                let rh = CGFloat(((i * 19) % 34) + 10)
-                ctx.setFillColor(c2.withAlphaComponent(0.72).cgColor)
-                ctx.fillEllipse(in: CGRect(x: cx - rw * 0.5, y: cy - rh * 0.5, width: rw, height: rh))
-            }
-            // Полярные ледяные шапки для Земли и Марса
-            if body.id == "earth" || body.id == "mars" {
-                ctx.setFillColor(UIColor(white: 0.96, alpha: 0.92).cgColor)
-                ctx.fill(CGRect(x: 0, y: 0, width: w, height: 16))
-                ctx.fill(CGRect(x: 0, y: h - 16, width: w, height: 16))
+            let seed = deterministicSeed(body.id)
+            if body.id == "jupiter" || body.id == "saturn" || body.id == "uranus" || body.id == "neptune" {
+                for row in 0..<48 {
+                    let y = CGFloat(row) * CGFloat(h) / 48.0
+                    let bandH = CGFloat(h) / 48.0 + 1.0
+                    let s = (seed &+ UInt64(row * 31)) % 5
+                    let col = (s == 0 || s == 2) ? c2.withAlphaComponent(0.75) : c1.withAlphaComponent(0.85)
+                    ctx.setFillColor(col.cgColor)
+                    ctx.fill(CGRect(x: 0, y: y, width: CGFloat(w), height: bandH))
+                }
+                if body.id == "jupiter" {
+                    ctx.setFillColor(UIColor(red: 0.82, green: 0.34, blue: 0.22, alpha: 0.85).cgColor)
+                    ctx.fillEllipse(in: CGRect(x: 310, y: 146, width: 44, height: 24))
+                }
+            } else {
+                for i in 0..<260 {
+                    let u = UInt64(i)
+                    let cx = CGFloat((u &* 97 &+ seed) % UInt64(w))
+                    let cy = CGFloat((u &* 53 &+ (seed >> 8)) % UInt64(h - 32) + 16)
+                    let rw = CGFloat((u &* 29 &+ (seed >> 16)) % 54 + 10)
+                    let rh = CGFloat((u &* 19 &+ (seed >> 24)) % 30 + 8)
+                    ctx.setFillColor(c2.withAlphaComponent(0.78).cgColor)
+                    ctx.fillEllipse(in: CGRect(x: cx - rw * 0.5, y: cy - rh * 0.5, width: rw, height: rh))
+                }
+                if body.id == "earth" || body.id == "mars" {
+                    ctx.setFillColor(UIColor(white: 0.96, alpha: 0.94).cgColor)
+                    ctx.fill(CGRect(x: 0, y: 0, width: w, height: 15))
+                    ctx.fill(CGRect(x: 0, y: h - 15, width: w, height: 15))
+                }
             }
         }
-        let img = UIGraphicsGetImageFromCurrentImageContext() ?? UIImage()
-        UIGraphicsEndImageContext()
-        return img
     }
 
-    private func generateCloudTexture(seed: Int) -> UIImage {
+    private func generateCloudTexture(seed: UInt64) -> UIImage {
         let w = 512, h = 256
-        UIGraphicsBeginImageContextWithOptions(CGSize(width: w, height: h), false, 1.0)
-        guard let ctx = UIGraphicsGetCurrentContext() else { return UIImage() }
-        ctx.clear(CGRect(x: 0, y: 0, width: w, height: h))
-        let s = abs(seed)
-        for i in 0..<220 {
-            let x = CGFloat((i * 131 + s) % w)
-            let y = CGFloat((i * 71 + s) % h)
-            let rw = CGFloat((i % 46) + 18)
-            let rh = CGFloat((i % 14) + 6)
-            ctx.setFillColor(UIColor(white: 1.0, alpha: 0.34).cgColor)
-            ctx.fillEllipse(in: CGRect(x: x, y: y, width: rw, height: rh))
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: w, height: h))
+        return renderer.image { context in
+            let ctx = context.cgContext
+            ctx.clear(CGRect(x: 0, y: 0, width: w, height: h))
+            for i in 0..<260 {
+                let u = UInt64(i)
+                let x = CGFloat((u &* 131 &+ seed) % UInt64(w))
+                let y = CGFloat((u &* 71 &+ (seed >> 8)) % UInt64(h))
+                let rw = CGFloat((u &* 37 &+ seed) % 48 + 16)
+                let rh = CGFloat((u &* 17 &+ seed) % 14 + 5)
+                ctx.setFillColor(UIColor(white: 1.0, alpha: 0.36).cgColor)
+                ctx.fillEllipse(in: CGRect(x: x, y: y, width: rw, height: rh))
+            }
         }
-        let img = UIGraphicsGetImageFromCurrentImageContext() ?? UIImage()
-        UIGraphicsEndImageContext()
-        return img
     }
 
     private func generateRingTexture(isBlackHole: Bool) -> UIImage {
         let size = 256
-        UIGraphicsBeginImageContextWithOptions(CGSize(width: size, height: size), false, 1.0)
-        guard let ctx = UIGraphicsGetCurrentContext() else { return UIImage() }
-        let center = CGPoint(x: size / 2, y: size / 2)
-        for r in 65..<126 {
-            if !isBlackHole && (r == 98 || r == 99 || r == 114) { continue } // Щель Кассини
-            let alpha = isBlackHole ? CGFloat(126 - r) / 65.0 : CGFloat((r % 7) + 3) / 14.0
-            let col = isBlackHole
-                ? UIColor(red: 1.0, green: 0.62, blue: 0.18, alpha: alpha)
-                : UIColor(red: 0.88, green: 0.79, blue: 0.60, alpha: alpha)
-            ctx.setStrokeColor(col.cgColor)
-            ctx.setLineWidth(1.2)
-            ctx.addArc(center: center, radius: CGFloat(r), startAngle: 0, endAngle: .pi * 2, clockwise: false)
-            ctx.strokePath()
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: size, height: size))
+        return renderer.image { context in
+            let ctx = context.cgContext
+            let center = CGPoint(x: size / 2, y: size / 2)
+            for r in 65..<126 {
+                if !isBlackHole && (r == 98 || r == 99 || r == 114) { continue }
+                let alpha = isBlackHole ? CGFloat(126 - r) / 65.0 : CGFloat((r % 7) + 3) / 14.0
+                let col = isBlackHole
+                    ? UIColor(red: 1.0, green: 0.62, blue: 0.18, alpha: alpha)
+                    : UIColor(red: 0.88, green: 0.79, blue: 0.60, alpha: alpha)
+                ctx.setStrokeColor(col.cgColor)
+                ctx.setLineWidth(1.2)
+                ctx.addArc(center: center, radius: CGFloat(r), startAngle: 0, endAngle: .pi * 2, clockwise: false)
+                ctx.strokePath()
+            }
         }
-        let img = UIGraphicsGetImageFromCurrentImageContext() ?? UIImage()
-        UIGraphicsEndImageContext()
-        return img
     }
 
     func rotateShip(yawDelta: Double, pitchDelta: Double) {
@@ -464,19 +454,16 @@ final class SpaceSimulationController: ObservableObject {
         let forwardVec = shipOrientation.act(SIMD3<Double>(0, 0, -1))
         shipPositionMeters += forwardVec * currentSpeed * dt
 
-        // Анимация факелов двигателей от тяги
         let flameScale = Float(max(0.05, throttle * (1.0 + Double(speedIndex) * 0.25)))
         for fNode in exhaustNodes {
             fNode.scale = SCNVector3(1.0, flameScale, 1.0)
             fNode.isHidden = throttle <= 0.01
         }
 
-        // Направление солнечного света из центра системы (0,0,0) к позиции корабля
         let sunDir = simd_normalize(shipPositionMeters)
         let fDir = SIMD3<Float>(Float(sunDir.x), Float(sunDir.y), Float(sunDir.z))
         sunLightNode.simdLook(at: fDir, up: SIMD3<Float>(0, 1, 0), localFront: SIMD3<Float>(0, 0, -1))
 
-        // Floating Origin + логарифмическое масштабирование 1:1
         for body in UniverseCatalog.bodies {
             guard let node = bodyNodes[body.id] else { continue }
             let rel = body.positionMeters - shipPositionMeters
